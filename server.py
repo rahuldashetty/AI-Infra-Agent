@@ -466,3 +466,98 @@ async def check_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
         return f"Error checking top processes: {str(e)}"
 
 
+# ===========================
+# Docker Monitoring Tools
+# ===========================
+
+@mcp.tool()
+async def docker_container_logs(container_name: str, lines: int = 100) -> str:
+    """
+    Tail logs from a specific Docker container.
+
+    Args:
+        container_name: Name of the container (alphanumeric, dots, underscores, hyphens only)
+        lines: Number of log lines to retrieve (1-1000, default 100)
+
+    Returns:
+        Recent log output from the specified container
+    """
+    try:
+        # Validate container name
+        _sanitize_identifier(container_name, "container_name")
+
+        # Validate lines parameter
+        if not isinstance(lines, int) or lines < 1 or lines > 1000:
+            return "Error: lines must be between 1 and 1000"
+
+        command = f"docker logs --tail {lines} {shlex.quote(container_name)}"
+        output = await run_ssh_command(command)
+
+        return f"Logs from container '{container_name}' (last {lines} lines):\n\n{output}"
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error fetching container logs: {str(e)}"
+
+
+@mcp.tool()
+async def docker_container_stats() -> str:
+    """
+    Get live resource usage statistics for all Docker containers.
+
+    Returns CPU%, memory usage/limit, memory%, network I/O, and block I/O
+    for each running container. This is a snapshot (not streaming).
+    """
+    try:
+        command = 'docker stats --no-stream --format "table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}\\t{{.NetIO}}\\t{{.BlockIO}}"'
+        output = await run_ssh_command(command)
+
+        return f"Docker container resource usage:\n\n{output}"
+
+    except Exception as e:
+        return f"Error fetching container stats: {str(e)}"
+
+
+@mcp.tool()
+async def check_app_containers(name_filter: str = "") -> str:
+    """
+    Check health status of Docker containers, optionally filtered by name.
+
+    Returns status, uptime, and health check information for matching containers.
+
+    Args:
+        name_filter: Optional container name filter (e.g., "my-app", "nginx"). Empty shows all containers.
+    """
+    try:
+        filter_clause = ""
+        if name_filter:
+            if not re.match(r'^[a-zA-Z0-9._-]+$', name_filter):
+                return "Error: Invalid name filter. Only alphanumeric, dots, underscores, and hyphens allowed."
+            filter_clause = f" --filter name={shlex.quote(name_filter)}"
+
+        list_command = f'docker ps -a{filter_clause} --format "table {{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}"'
+        list_output = await run_ssh_command(list_command)
+
+        containers = []
+        for line in list_output.strip().split('\n')[1:]:
+            parts = line.split('\t')
+            if parts:
+                containers.append(parts[0])
+
+        filter_label = f" (filter: {name_filter})" if name_filter else ""
+        result = f"Container health{filter_label}:\n\n{list_output}\n"
+
+        if containers:
+            result += "\n--- Health Details ---\n"
+            for container in containers:
+                health_command = f'docker inspect --format="{{{{.Name}}}}: {{{{.State.Health.Status}}}}" {shlex.quote(container)} 2>/dev/null || echo "{container}: no health check configured"'
+                health_output = await run_ssh_command(health_command)
+                result += f"{health_output}\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error checking container health: {str(e)}"
+
+
