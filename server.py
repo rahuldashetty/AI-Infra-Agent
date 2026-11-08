@@ -1612,3 +1612,485 @@ async def find_application_errors(name: str, hours: int = 24, platform: str = "a
         return f"Error searching application errors: {str(e)}"
 
 
+# ===========================
+# Smart Troubleshooting
+# ===========================
+
+@mcp.tool()
+async def full_system_health_scan() -> str:
+    """
+    One-shot comprehensive system health scan with intelligent threshold checks.
+
+    Checks disk, memory, CPU load, inodes, failed services, Docker containers,
+    kernel errors, and network connections. Flags issues as OK, WARNING, or CRITICAL.
+    This is the recommended first troubleshooting tool when something seems wrong.
+    """
+    try:
+        probes = await asyncio.gather(
+            run_ssh_command("uptime"),
+            run_ssh_command("cat /proc/loadavg"),
+            run_ssh_command("nproc 2>/dev/null || echo 1"),
+            run_ssh_command("free -m 2>/dev/null"),
+            run_ssh_command("df -h 2>/dev/null"),
+            run_ssh_command("df -i 2>/dev/null"),
+            run_ssh_command("systemctl --failed --no-pager --no-legend 2>/dev/null"),
+            run_ssh_command('docker ps -a --format "{{.Names}}\t{{.Status}}" 2>/dev/null || echo ""'),
+            run_ssh_command("dmesg --level=err,warn -T 2>/dev/null | tail -5 || echo ''"),
+            run_ssh_command("ss -s 2>/dev/null"),
+            run_ssh_command("ps aux 2>/dev/null | awk '$8==\"Z\"' | head -5 || echo ''"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        uptime_info = safe(0)
+        loadavg = safe(1)
+        cpus = safe(2)
+        memory = safe(3)
+        disk = safe(4)
+        inodes = safe(5)
+        failed_services = safe(6)
+        docker_containers = safe(7)
+        dmesg_errors = safe(8)
+        network_summary = safe(9)
+        zombies = safe(10)
+
+        warnings = 0
+        criticals = 0
+        result = "=== Full System Health Scan ===\n\n"
+
+        # Load average check
+        try:
+            cpu_count = int(cpus) if cpus.isdigit() else 1
+            load_parts = loadavg.split()
+            load_1m = float(load_parts[0])
+            if load_1m > cpu_count * 2:
+                status = "CRITICAL"
+                criticals += 1
+            elif load_1m > cpu_count:
+                status = "WARNING"
+                warnings += 1
+            else:
+                status = "OK"
+            result += f"--- System Load ---\n"
+            result += f"  {uptime_info}\n"
+            result += f"  Load 1m: {load_1m} / {cpu_count} CPUs  [{status}]\n\n"
+        except Exception:
+            result += f"--- System Load ---\n  {uptime_info}  [OK]\n\n"
+
+        # Memory check
+        result += "--- Memory ---\n"
+        try:
+            mem_lines = memory.split('\n')
+            for line in mem_lines:
+                result += f"  {line}\n"
+            # Parse memory percentage from 'free -m' output
+            if len(mem_lines) >= 2:
+                parts = mem_lines[1].split()
+                if len(parts) >= 3:
+                    total = int(parts[1])
+                    used = int(parts[2])
+                    pct = (used / total * 100) if total > 0 else 0
+                    if pct > 95:
+                        result += f"  Usage: {pct:.0f}%  [CRITICAL]\n"
+                        criticals += 1
+                    elif pct > 85:
+                        result += f"  Usage: {pct:.0f}%  [WARNING]\n"
+                        warnings += 1
+                    else:
+                        result += f"  Usage: {pct:.0f}%  [OK]\n"
+        except Exception:
+            result += f"  {memory}\n"
+        result += "\n"
+
+        # Disk check
+        result += "--- Disk ---\n"
+        try:
+            for line in disk.split('\n'):
+                if line.strip() and not line.startswith("Filesystem"):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        use_pct = parts[4].rstrip('%')
+                        if use_pct.isdigit():
+                            pct = int(use_pct)
+                            if pct > 95:
+                                result += f"  {line}  [CRITICAL]\n"
+                                criticals += 1
+                            elif pct > 85:
+                                result += f"  {line}  [WARNING]\n"
+                                warnings += 1
+                            else:
+                                result += f"  {line}  [OK]\n"
+                        else:
+                            result += f"  {line}\n"
+                    else:
+                        result += f"  {line}\n"
+        except Exception:
+            result += f"  {disk}\n"
+        result += "\n"
+
+        # Inode check
+        result += "--- Inodes ---\n"
+        try:
+            inode_issues = False
+            for line in inodes.split('\n'):
+                if line.strip() and not line.startswith("Filesystem"):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        use_pct = parts[4].rstrip('%')
+                        if use_pct.isdigit() and int(use_pct) > 80:
+                            result += f"  {line}  [WARNING]\n"
+                            warnings += 1
+                            inode_issues = True
+            if not inode_issues:
+                result += "  All filesystems OK\n"
+        except Exception:
+            result += "  (could not check)\n"
+        result += "\n"
+
+        # Failed services
+        result += "--- Failed Services ---\n"
+        if failed_services and "0 loaded units listed" not in failed_services:
+            count = len([l for l in failed_services.split('\n') if l.strip()])
+            result += f"  {failed_services}\n"
+            result += f"  [{count} failed service(s) — WARNING]\n"
+            warnings += count
+        else:
+            result += "  None  [OK]\n"
+        result += "\n"
+
+        # Docker containers
+        result += "--- Docker Containers ---\n"
+        if docker_containers:
+            stopped = []
+            running = 0
+            for line in docker_containers.split('\n'):
+                if line.strip():
+                    if 'Up' in line:
+                        running += 1
+                    else:
+                        stopped.append(line.strip())
+            result += f"  Running: {running}\n"
+            if stopped:
+                for s in stopped:
+                    result += f"  Stopped: {s}  [WARNING]\n"
+                    warnings += 1
+            else:
+                result += "  All containers running  [OK]\n"
+        else:
+            result += "  Docker not available or no containers\n"
+        result += "\n"
+
+        # Kernel errors
+        result += "--- Recent Kernel Issues ---\n"
+        if dmesg_errors:
+            result += f"  {dmesg_errors}\n"
+            result += "  [WARNING — kernel errors detected]\n"
+            warnings += 1
+        else:
+            result += "  None  [OK]\n"
+        result += "\n"
+
+        # Zombie processes
+        result += "--- Zombie Processes ---\n"
+        if zombies:
+            count = len([l for l in zombies.split('\n') if l.strip()])
+            result += f"  {count} zombie process(es) found  [WARNING]\n"
+            warnings += 1
+        else:
+            result += "  None  [OK]\n"
+        result += "\n"
+
+        # Network
+        result += "--- Network ---\n"
+        result += f"  {network_summary}\n\n"
+
+        # Summary
+        if criticals > 0:
+            overall = "CRITICAL"
+        elif warnings > 0:
+            overall = "WARNINGS"
+        else:
+            overall = "HEALTHY"
+
+        result += f"=== Overall: {overall} ({criticals} critical, {warnings} warnings) ==="
+
+        return result
+
+    except Exception as e:
+        return f"Error running system health scan: {str(e)}"
+
+
+@mcp.tool()
+async def check_port_connectivity(port: int, host: str = "localhost") -> str:
+    """
+    Check if a specific port is listening, what process owns it, and test connectivity.
+
+    Args:
+        port: Port number to check (1-65535)
+        host: Host to check (default "localhost")
+    """
+    try:
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return "Error: port must be between 1 and 65535"
+
+        _sanitize_identifier(host, "host")
+
+        quoted_host = shlex.quote(host)
+
+        probes = await asyncio.gather(
+            run_ssh_command(f"ss -tlnp 2>/dev/null | grep ':{port} ' || echo 'NOT_LISTENING'"),
+            run_ssh_command(f'timeout 5 bash -c "echo >/dev/tcp/{quoted_host}/{port}" 2>/dev/null && echo OPEN || echo CLOSED'),
+            run_ssh_command(f'curl -s -o /dev/null -w "%{{http_code}}" --connect-timeout 5 http://{quoted_host}:{port}/ 2>/dev/null || echo NO_HTTP'),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        ss_output = safe(0)
+        tcp_test = safe(1)
+        http_test = safe(2)
+
+        result = f"=== Port Check: {port} on {host} ===\n\n"
+
+        if "NOT_LISTENING" in ss_output:
+            result += "Listening:    No — nothing is bound to this port\n"
+        else:
+            result += "Listening:    Yes\n"
+            for line in ss_output.split('\n'):
+                if line.strip():
+                    result += f"  {line.strip()}\n"
+
+        result += f"\nTCP Test:     {tcp_test}\n"
+
+        if http_test and http_test != "NO_HTTP":
+            result += f"HTTP Test:    Status {http_test}\n"
+        else:
+            result += "HTTP Test:    No HTTP response (not an HTTP service or connection refused)\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error checking port connectivity: {str(e)}"
+
+
+@mcp.tool()
+async def check_ssl_certificate(host: str, port: int = 443) -> str:
+    """
+    Check SSL/TLS certificate validity, expiration, and issuer.
+
+    Connects to the specified host:port and retrieves certificate details
+    including subject, issuer, validity dates, and days until expiration.
+
+    Args:
+        host: Hostname or IP to check
+        port: Port number (default 443)
+    """
+    try:
+        _sanitize_identifier(host, "host")
+
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return "Error: port must be between 1 and 65535"
+
+        quoted_host = shlex.quote(host)
+
+        cert_output = await run_ssh_command(
+            f"echo | openssl s_client -connect {quoted_host}:{port} -servername {quoted_host} 2>/dev/null "
+            f"| openssl x509 -noout -subject -issuer -dates -serial 2>/dev/null"
+        )
+
+        if not cert_output.strip():
+            return f"Could not retrieve SSL certificate from {host}:{port}. The host may not support SSL/TLS on this port, or openssl is not installed."
+
+        expiry_check = await run_ssh_command(
+            f"echo | openssl s_client -connect {quoted_host}:{port} -servername {quoted_host} 2>/dev/null "
+            f"| openssl x509 -noout -checkend 2592000 2>/dev/null && echo VALID_30D || echo EXPIRING_30D"
+        )
+
+        result = f"=== SSL Certificate: {host}:{port} ===\n\n"
+
+        for line in cert_output.strip().split('\n'):
+            if line.strip():
+                result += f"  {line.strip()}\n"
+
+        result += "\n"
+
+        if "EXPIRING_30D" in expiry_check:
+            result += "Status: WARNING — certificate expires within 30 days!\n"
+        else:
+            result += "Status: VALID (not expiring within 30 days)\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error checking SSL certificate: {str(e)}"
+
+
+@mcp.tool()
+async def find_error_patterns(hours: int = 1, pattern: str = "error") -> str:
+    """
+    Search ALL log sources for error patterns.
+
+    Scans system journal, kernel logs (dmesg), Docker container logs, and /var/log
+    files for the specified error pattern within the time window.
+
+    Args:
+        hours: Hours to look back (1-72, default 1)
+        pattern: Error pattern to search for (default "error"). Must be one of:
+                 error, exception, fatal, panic, critical, warning, oom, timeout,
+                 refused, denied, traceback, segfault, killed, fail
+    """
+    try:
+        if not isinstance(hours, int) or hours < 1 or hours > 72:
+            return "Error: hours must be between 1 and 72"
+
+        pattern_lower = pattern.lower().strip()
+        if pattern_lower not in ALLOWED_ERROR_PATTERNS:
+            return (
+                f"Error: pattern must be one of: {', '.join(sorted(ALLOWED_ERROR_PATTERNS))}. "
+                f"Got: '{pattern}'"
+            )
+
+        quoted_pattern = shlex.quote(pattern_lower)
+
+        probes = await asyncio.gather(
+            run_ssh_command(f'journalctl --since "{hours} hours ago" -p err --no-pager -n 30 2>/dev/null || echo ""'),
+            run_ssh_command(f"dmesg --level=err,warn -T 2>/dev/null | tail -20 || echo ''"),
+            run_ssh_command(
+                f"docker ps -q 2>/dev/null | head -5 | while read cid; do "
+                f"name=$(docker inspect --format '{{{{.Name}}}}' $cid 2>/dev/null | tr -d '/'); "
+                f"docker logs --since {hours}h $cid 2>&1 | grep -i {quoted_pattern} | tail -3 | "
+                f"while read line; do echo \"[$name] $line\"; done; done || echo ''"
+            ),
+            run_ssh_command(
+                f"find /var/log -name '*.log' -mmin -{hours * 60} -readable 2>/dev/null | head -10 | "
+                f"xargs -I{{}} sh -c 'grep -li {quoted_pattern} {{}} 2>/dev/null' | head -10 || echo ''"
+            ),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else ""
+
+        journal_errors = safe(0)
+        dmesg_errors = safe(1)
+        docker_errors = safe(2)
+        log_files = safe(3)
+
+        total_matches = 0
+        result = f"=== Error Pattern Scan (last {hours} hour(s), pattern: '{pattern_lower}') ===\n\n"
+
+        result += "--- System Journal ---\n"
+        if journal_errors:
+            count = len([l for l in journal_errors.split('\n') if l.strip()])
+            total_matches += count
+            result += f"  ({count} entries)\n{journal_errors}\n\n"
+        else:
+            result += "  (no matches)\n\n"
+
+        result += "--- Kernel (dmesg) ---\n"
+        if dmesg_errors:
+            count = len([l for l in dmesg_errors.split('\n') if l.strip()])
+            total_matches += count
+            result += f"  ({count} entries)\n{dmesg_errors}\n\n"
+        else:
+            result += "  (no matches)\n\n"
+
+        result += "--- Docker Containers ---\n"
+        if docker_errors:
+            count = len([l for l in docker_errors.split('\n') if l.strip()])
+            total_matches += count
+            result += f"  ({count} entries)\n{docker_errors}\n\n"
+        else:
+            result += "  (no matches or Docker not available)\n\n"
+
+        result += "--- Log Files with Matches ---\n"
+        if log_files:
+            for f in log_files.split('\n'):
+                if f.strip():
+                    result += f"  {f.strip()}\n"
+        else:
+            result += "  (no matching log files found)\n"
+
+        result += f"\n--- Summary: {total_matches} match(es) found ---"
+
+        return result
+
+    except Exception as e:
+        return f"Error searching error patterns: {str(e)}"
+
+
+@mcp.tool()
+async def check_docker_compose_services(project_dir: str = None) -> str:
+    """
+    Detect Docker Compose projects and show service status.
+
+    Lists all running Compose projects, or checks a specific project directory.
+    Many applications deploy via docker-compose.yml — this tool understands that structure.
+
+    Args:
+        project_dir: Optional path to directory with docker-compose.yml
+                     (must start with /, alphanumeric and /_.- only, max 512 chars)
+    """
+    try:
+        # Check Docker Compose is available
+        compose_check = await run_ssh_command("docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo NOT_INSTALLED")
+
+        if "NOT_INSTALLED" in compose_check:
+            return "Docker Compose is not installed on this server."
+
+        if project_dir:
+            if len(project_dir) > 512:
+                return "Error: project_dir exceeds maximum length of 512 characters"
+            path_regex = re.compile(r'^[a-zA-Z0-9/_.\-]+$')
+            if not project_dir.startswith('/') or not path_regex.match(project_dir):
+                return "Error: project_dir must start with / and contain only alphanumeric, /, _, ., - characters"
+
+            quoted_dir = shlex.quote(project_dir)
+            output = await run_ssh_command(
+                f"docker compose -f {quoted_dir}/docker-compose.yml ps 2>/dev/null || "
+                f"docker-compose -f {quoted_dir}/docker-compose.yml ps 2>/dev/null || "
+                f"echo 'No docker-compose.yml found or Compose project not running at this path'"
+            )
+
+            return f"=== Docker Compose Services ({project_dir}) ===\n\n{output}"
+
+        # List all Compose projects
+        projects_output = await run_ssh_command("docker compose ls 2>/dev/null || echo ''")
+
+        if not projects_output.strip():
+            return "No running Docker Compose projects found (or Compose v2 not available for listing)."
+
+        result = "=== Docker Compose Projects ===\n\n"
+        result += f"{projects_output}\n"
+
+        # Get detailed status for each project (first 5)
+        lines = projects_output.strip().split('\n')
+        if len(lines) > 1:
+            for line in lines[1:6]:
+                parts = line.split()
+                if parts:
+                    project_name = parts[0]
+                    quoted_project = shlex.quote(project_name)
+                    try:
+                        ps_output = await run_ssh_command(f"docker compose -p {quoted_project} ps 2>/dev/null")
+                        if ps_output.strip():
+                            result += f"\n--- Project: {project_name} ---\n{ps_output}\n"
+                    except Exception:
+                        continue
+
+        return result
+
+    except Exception as e:
+        return f"Error checking Docker Compose services: {str(e)}"
+
+
