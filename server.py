@@ -561,3 +561,219 @@ async def check_app_containers(name_filter: str = "") -> str:
         return f"Error checking container health: {str(e)}"
 
 
+# ===========================
+# Disk & I/O Monitoring Tools
+# ===========================
+
+@mcp.tool()
+async def check_disk_io() -> str:
+    """
+    Check disk I/O statistics for all devices.
+
+    Returns read/write throughput, IOPS, queue depth, and utilization per device.
+    Requires iostat (sysstat package). Falls back to /proc/diskstats if unavailable.
+    """
+    try:
+        # Try iostat first (more readable)
+        output = await run_ssh_command("iostat -dx 1 1 2>/dev/null || cat /proc/diskstats")
+        return f"Disk I/O statistics:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking disk I/O: {str(e)}"
+
+
+@mcp.tool()
+async def check_inode_usage() -> str:
+    """
+    Check inode usage for all filesystems.
+
+    Servers can exhaust inodes before running out of disk space due to
+    many small files. This shows inode counts and usage percentages.
+    """
+    try:
+        output = await run_ssh_command("df -i")
+        return f"Inode usage on remote server:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking inode usage: {str(e)}"
+
+
+@mcp.tool()
+async def check_disk_usage_by_path(path: str = "/") -> str:
+    """
+    Get disk usage breakdown for all subdirectories under a specific path.
+
+    Args:
+        path: Directory path to analyze (default: "/")
+              Must start with / and contain only alphanumeric, /, _, ., - characters
+              Maximum 512 characters
+
+    Returns:
+        Human-readable size summary for each immediate subdirectory
+    """
+    try:
+        # Validate path to prevent command injection
+        if not path:
+            path = "/"
+
+        if len(path) > 512:
+            return "Error: path exceeds maximum length of 512 characters"
+
+        # Strict path validation: must start with / and contain only safe characters
+        path_regex = re.compile(r'^[a-zA-Z0-9/_.\-]+$')
+        if not path.startswith('/') or not path_regex.match(path):
+            return "Error: path must start with / and contain only alphanumeric, /, _, ., - characters"
+
+        # Use shlex.quote for additional safety
+        command = f"du -sh {shlex.quote(path)}/* 2>/dev/null | sort -rh"
+        output = await run_ssh_command(command)
+
+        if not output.strip():
+            return f"No subdirectories found under {path} or path does not exist"
+
+        return f"Disk usage breakdown for {path}:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking disk usage by path: {str(e)}"
+
+
+# ===========================
+# Network Monitoring Tools
+# ===========================
+
+@mcp.tool()
+async def check_network_stats() -> str:
+    """
+    Get network interface statistics.
+
+    Returns RX/TX bytes, packets, errors, and drops for each network interface.
+    Useful for identifying network saturation or hardware issues.
+    """
+    try:
+        output = await run_ssh_command("ip -s link")
+        return f"Network interface statistics:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking network stats: {str(e)}"
+
+
+@mcp.tool()
+async def check_network_connections() -> str:
+    """
+    Get TCP connection state summary.
+
+    Returns counts of connections in each state (ESTABLISHED, TIME-WAIT, CLOSE-WAIT, etc.).
+    High TIME-WAIT or CLOSE-WAIT counts can indicate application issues.
+    """
+    try:
+        output = await run_ssh_command("ss -s")
+        return f"Network connection summary:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking network connections: {str(e)}"
+
+
+@mcp.tool()
+async def check_open_ports() -> str:
+    """
+    List all TCP listening ports with process information.
+
+    Shows local address, port, and process name/PID for each listening socket.
+    Essential for security audits and service discovery.
+    """
+    try:
+        output = await run_ssh_command("ss -tlnp")
+        return f"Open TCP listening ports:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking open ports: {str(e)}"
+
+
+# ===========================
+# Services & Logs Tools
+# ===========================
+
+@mcp.tool()
+async def check_failed_services() -> str:
+    """
+    List all failed systemd services.
+
+    Quick health check to identify any systemd units in failed state.
+    Empty output means all services are healthy.
+    """
+    try:
+        output = await run_ssh_command("systemctl --failed")
+
+        if not output.strip() or "0 loaded units listed" in output:
+            return "All systemd services are healthy (no failed units)"
+
+        return f"Failed systemd services:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking failed services: {str(e)}"
+
+
+@mcp.tool()
+async def check_journal_logs(unit: str, lines: int = 50) -> str:
+    """
+    View logs for a specific systemd service.
+
+    Args:
+        unit: Service unit name (e.g., "nginx", "my-app")
+              Alphanumeric, dots, underscores, hyphens only
+        lines: Number of log lines to retrieve (1-500, default 50)
+
+    Returns:
+        Recent journal logs for the specified service
+    """
+    try:
+        # Validate unit name
+        _sanitize_identifier(unit, "unit")
+
+        # Validate lines parameter
+        if not isinstance(lines, int) or lines < 1 or lines > 500:
+            return "Error: lines must be between 1 and 500"
+
+        command = f"journalctl -u {shlex.quote(unit)} --no-pager -n {lines}"
+        output = await run_ssh_command(command)
+
+        return f"Journal logs for '{unit}' (last {lines} lines):\n\n{output}"
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error fetching journal logs: {str(e)}"
+
+
+@mcp.tool()
+async def check_dmesg_errors(lines: int = 50) -> str:
+    """
+    View recent kernel errors and warnings from dmesg.
+
+    Shows OOM kills, hardware failures, disk errors, and other kernel-level issues.
+    Critical for diagnosing system-level problems.
+
+    Args:
+        lines: Number of log lines to retrieve (1-500, default 50)
+
+    Returns:
+        Recent kernel error and warning messages with timestamps
+    """
+    try:
+        # Validate lines parameter
+        if not isinstance(lines, int) or lines < 1 or lines > 500:
+            return "Error: lines must be between 1 and 500"
+
+        # Use dmesg with human-readable timestamps and filter for errors/warnings
+        command = f"dmesg --level=err,warn -T | tail -n {lines}"
+        output = await run_ssh_command(command)
+
+        if not output.strip():
+            return "No recent kernel errors or warnings found"
+
+        return f"Recent kernel errors/warnings (last {lines} lines):\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking dmesg errors: {str(e)}"
+
+
