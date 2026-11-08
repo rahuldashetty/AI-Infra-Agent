@@ -1190,3 +1190,425 @@ async def detect_process_managers() -> str:
         return f"Error detecting process managers: {str(e)}"
 
 
+# ===========================
+# Application Stack Detection & Diagnostics
+# ===========================
+
+@mcp.tool()
+async def detect_application_stack() -> str:
+    """
+    Auto-detect the application stack running on the server.
+
+    Identifies web servers (nginx, Apache, Caddy), databases (MySQL, PostgreSQL, MongoDB,
+    Redis), language runtimes (Node.js, Python, Java, Go, Ruby, .NET), and other
+    common services by examining running processes, listening ports, and installed runtimes.
+    """
+    try:
+        probes = await asyncio.gather(
+            run_ssh_command("ps aux 2>/dev/null | grep -E '(nginx|apache2|httpd|caddy|lighttpd|haproxy)' | grep -v grep | head -10"),
+            run_ssh_command("ps aux 2>/dev/null | grep -E '(mysqld|mariadbd|postgres|mongod|mongos|redis-server|memcached|elasticsearch|clickhouse)' | grep -v grep | head -10"),
+            run_ssh_command("ps aux 2>/dev/null | grep -E '(node |python3?|java |ruby |dotnet |beam.smp|php-fpm|gunicorn|uvicorn|puma|pm2)' | grep -v grep | head -15"),
+            run_ssh_command("ss -tlnp 2>/dev/null | grep LISTEN | head -30"),
+            run_ssh_command("command -v node && node --version 2>/dev/null || echo ''"),
+            run_ssh_command("command -v python3 && python3 --version 2>/dev/null || echo ''"),
+            run_ssh_command("command -v java && java -version 2>&1 | head -1 || echo ''"),
+            run_ssh_command("command -v go && go version 2>/dev/null || echo ''"),
+            run_ssh_command("command -v ruby && ruby --version 2>/dev/null || echo ''"),
+            run_ssh_command("command -v dotnet && dotnet --version 2>/dev/null || echo ''"),
+            run_ssh_command("command -v php && php --version 2>/dev/null | head -1 || echo ''"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else ""
+
+        web_servers = safe(0)
+        databases = safe(1)
+        app_processes = safe(2)
+        listening_ports = safe(3)
+        node_ver = safe(4)
+        python_ver = safe(5)
+        java_ver = safe(6)
+        go_ver = safe(7)
+        ruby_ver = safe(8)
+        dotnet_ver = safe(9)
+        php_ver = safe(10)
+
+        result = "=== Application Stack Detection ===\n\n"
+
+        result += "--- Web Servers / Reverse Proxies ---\n"
+        if web_servers:
+            for line in web_servers.split('\n'):
+                if line.strip():
+                    parts = line.split()
+                    result += f"  {parts[10] if len(parts) > 10 else parts[-1]} (PID: {parts[1] if len(parts) > 1 else '?'})\n"
+        else:
+            result += "  (none detected)\n"
+
+        result += "\n--- Databases & Data Stores ---\n"
+        if databases:
+            for line in databases.split('\n'):
+                if line.strip():
+                    parts = line.split()
+                    result += f"  {parts[10] if len(parts) > 10 else parts[-1]} (PID: {parts[1] if len(parts) > 1 else '?'})\n"
+        else:
+            result += "  (none detected)\n"
+
+        result += "\n--- Application Processes ---\n"
+        if app_processes:
+            for line in app_processes.split('\n'):
+                if line.strip():
+                    parts = line.split()
+                    result += f"  {' '.join(parts[10:]) if len(parts) > 10 else parts[-1]} (User: {parts[0] if parts else '?'}, PID: {parts[1] if len(parts) > 1 else '?'})\n"
+        else:
+            result += "  (none detected)\n"
+
+        result += "\n--- Installed Language Runtimes ---\n"
+        runtimes = [
+            ("Node.js", node_ver), ("Python", python_ver), ("Java", java_ver),
+            ("Go", go_ver), ("Ruby", ruby_ver), (".NET", dotnet_ver), ("PHP", php_ver)
+        ]
+        found_any = False
+        for name, ver in runtimes:
+            if ver and "command -v" not in ver:
+                result += f"  {name}: {ver.split(chr(10))[-1]}\n"
+                found_any = True
+        if not found_any:
+            result += "  (none detected)\n"
+
+        result += "\n--- Listening Ports ---\n"
+        if listening_ports:
+            result += f"{listening_ports}\n"
+        else:
+            result += "  (none detected)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting application stack: {str(e)}"
+
+
+@mcp.tool()
+async def find_application(name: str) -> str:
+    """
+    Find an application or service across all platforms.
+
+    Searches Docker containers, systemd services, Kubernetes pods, PM2 processes,
+    and system processes for the given name.
+
+    Args:
+        name: Application or service name to search for (partial match)
+    """
+    try:
+        _sanitize_identifier(name, "name")
+        quoted_name = shlex.quote(name)
+
+        probes = await asyncio.gather(
+            run_ssh_command(f'docker ps -a --filter "name={quoted_name}" --format "table {{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.Image}}}}\\t{{{{.Ports}}}}" 2>/dev/null || echo ""'),
+            run_ssh_command(f"systemctl list-units --type=service --no-pager --no-legend 2>/dev/null | grep -i {quoted_name} || echo ''"),
+            run_ssh_command(f"kubectl get pods -A --no-headers 2>/dev/null | grep -i {quoted_name} | head -20 || echo ''"),
+            run_ssh_command(f"pm2 show {quoted_name} 2>/dev/null | head -20 || echo ''"),
+            run_ssh_command(f"pgrep -a -i {quoted_name} 2>/dev/null | head -20 || echo ''"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else ""
+
+        docker_result = safe(0)
+        systemd_result = safe(1)
+        k8s_result = safe(2)
+        pm2_result = safe(3)
+        process_result = safe(4)
+
+        found_anywhere = False
+        result = f"=== Search Results for '{name}' ===\n\n"
+
+        result += "--- Docker ---\n"
+        if docker_result and "NAMES" in docker_result and len(docker_result.split('\n')) > 1:
+            result += f"  {docker_result}\n\n"
+            found_anywhere = True
+        elif docker_result and "NAMES" not in docker_result and docker_result:
+            result += f"  {docker_result}\n\n"
+            found_anywhere = True
+        else:
+            result += "  (not found in Docker containers)\n\n"
+
+        result += "--- systemd ---\n"
+        if systemd_result:
+            result += f"  {systemd_result}\n\n"
+            found_anywhere = True
+        else:
+            result += "  (not found in systemd services)\n\n"
+
+        result += "--- Kubernetes ---\n"
+        if k8s_result:
+            result += f"  {k8s_result}\n\n"
+            found_anywhere = True
+        else:
+            result += "  (not found in Kubernetes pods)\n\n"
+
+        result += "--- PM2 ---\n"
+        if pm2_result:
+            result += f"  {pm2_result}\n\n"
+            found_anywhere = True
+        else:
+            result += "  (not found in PM2)\n\n"
+
+        result += "--- System Processes ---\n"
+        if process_result:
+            result += f"  {process_result}\n"
+            found_anywhere = True
+        else:
+            result += "  (no matching processes found)\n"
+
+        if not found_anywhere:
+            result += f"\nApplication '{name}' was not found on any platform."
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error finding application: {str(e)}"
+
+
+@mcp.tool()
+async def get_application_logs(name: str, platform: str = "auto", lines: int = 100) -> str:
+    """
+    Get logs for an application regardless of which platform runs it.
+
+    Auto-detects the platform or uses the specified one to fetch logs.
+
+    Args:
+        name: Application/container/service name
+        platform: One of "auto", "docker", "systemd", "kubernetes", "pm2" (default "auto")
+        lines: Number of log lines to retrieve (1-1000, default 100)
+    """
+    try:
+        _sanitize_identifier(name, "name")
+
+        if platform not in ALLOWED_PLATFORMS:
+            return f"Error: platform must be one of {', '.join(sorted(ALLOWED_PLATFORMS))}. Got: '{platform}'"
+
+        if not isinstance(lines, int) or lines < 1 or lines > 1000:
+            return "Error: lines must be between 1 and 1000"
+
+        quoted_name = shlex.quote(name)
+
+        if platform == "auto":
+            # Try each platform in order, return first successful result
+            platforms_to_try = ["docker", "systemd", "kubernetes", "pm2"]
+        else:
+            platforms_to_try = [platform]
+
+        for plat in platforms_to_try:
+            try:
+                if plat == "docker":
+                    output = await run_ssh_command(f"docker logs --tail {lines} {quoted_name} 2>&1")
+                    if output.strip() and "No such container" not in output and "Error" not in output.split('\n')[0]:
+                        return f"Logs from Docker container '{name}' (last {lines} lines):\n\n{output}"
+                elif plat == "systemd":
+                    output = await run_ssh_command(f"journalctl -u {quoted_name} --no-pager -n {lines} 2>/dev/null")
+                    if output.strip() and "No entries" not in output and "-- No entries --" not in output:
+                        return f"Logs from systemd unit '{name}' (last {lines} lines):\n\n{output}"
+                elif plat == "kubernetes":
+                    # First find the pod
+                    pod_output = await run_ssh_command(f"kubectl get pods -A --no-headers 2>/dev/null | grep -i {quoted_name} | head -1")
+                    if pod_output.strip():
+                        parts = pod_output.strip().split()
+                        if len(parts) >= 2:
+                            namespace = parts[0]
+                            pod_name = parts[1]
+                            output = await run_ssh_command(f"kubectl logs {shlex.quote(pod_name)} -n {shlex.quote(namespace)} --tail={lines} 2>/dev/null")
+                            if output.strip():
+                                return f"Logs from Kubernetes pod '{pod_name}' in namespace '{namespace}' (last {lines} lines):\n\n{output}"
+                elif plat == "pm2":
+                    output = await run_ssh_command(f"pm2 logs {quoted_name} --lines {lines} --nostream 2>/dev/null")
+                    if output.strip():
+                        return f"Logs from PM2 process '{name}' (last {lines} lines):\n\n{output}"
+            except Exception:
+                continue
+
+        return f"Could not find logs for '{name}' on any platform ({', '.join(platforms_to_try)}). Use find_application to locate it first."
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error fetching application logs: {str(e)}"
+
+
+@mcp.tool()
+async def check_application_health(name: str) -> str:
+    """
+    Comprehensive health check for a named application across all platforms.
+
+    Checks running status, resource usage, recent errors, and listening ports
+    for the application on Docker, systemd, Kubernetes, and PM2.
+
+    Args:
+        name: Application or service name to check
+    """
+    try:
+        _sanitize_identifier(name, "name")
+        quoted_name = shlex.quote(name)
+
+        probes = await asyncio.gather(
+            run_ssh_command(f'docker inspect --format "Status: {{{{.State.Status}}}}  Health: {{{{.State.Health.Status}}}}  Restarts: {{{{.RestartCount}}}}" {quoted_name} 2>/dev/null || docker inspect --format "Status: {{{{.State.Status}}}}  Restarts: {{{{.RestartCount}}}}" {quoted_name} 2>/dev/null || echo NOT_FOUND'),
+            run_ssh_command(f"docker stats --no-stream --format 'CPU: {{{{.CPUPerc}}}}  Memory: {{{{.MemUsage}}}} ({{{{.MemPerc}}}})' {quoted_name} 2>/dev/null || echo ''"),
+            run_ssh_command(f"systemctl show {quoted_name} --property=ActiveState,SubState,MainPID,MemoryCurrent --no-pager 2>/dev/null || echo ''"),
+            run_ssh_command(f"kubectl get pods -A --no-headers 2>/dev/null | grep -i {quoted_name} | head -5 || echo ''"),
+            run_ssh_command(f"pm2 show {quoted_name} 2>/dev/null | grep -E '(status|cpu|memory|restarts|uptime)' | head -10 || echo ''"),
+            run_ssh_command(f"docker logs --tail 10 {quoted_name} 2>&1 | grep -iE '(error|exception|fatal|panic|critical)' | tail -5 || echo ''"),
+            run_ssh_command(f"journalctl -u {quoted_name} -p err --no-pager -n 5 2>/dev/null || echo ''"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else ""
+
+        docker_status = safe(0)
+        docker_stats = safe(1)
+        systemd_status = safe(2)
+        k8s_pods = safe(3)
+        pm2_status = safe(4)
+        docker_errors = safe(5)
+        systemd_errors = safe(6)
+
+        found_on = []
+        result = f"=== Health Check: {name} ===\n\n"
+
+        if "NOT_FOUND" not in docker_status:
+            found_on.append("Docker")
+            result += "--- Docker ---\n"
+            result += f"  {docker_status}\n"
+            if docker_stats:
+                result += f"  Resources: {docker_stats}\n"
+            if docker_errors:
+                result += f"  Recent Errors:\n"
+                for line in docker_errors.split('\n'):
+                    if line.strip():
+                        result += f"    {line.strip()}\n"
+            result += "\n"
+
+        if systemd_status and "ActiveState=" in systemd_status:
+            found_on.append("systemd")
+            result += "--- systemd ---\n"
+            for line in systemd_status.split('\n'):
+                if line.strip() and '=' in line:
+                    result += f"  {line.strip()}\n"
+            if systemd_errors:
+                result += f"  Recent Errors:\n"
+                for line in systemd_errors.split('\n'):
+                    if line.strip():
+                        result += f"    {line.strip()}\n"
+            result += "\n"
+
+        if k8s_pods:
+            found_on.append("Kubernetes")
+            result += "--- Kubernetes ---\n"
+            for line in k8s_pods.split('\n'):
+                if line.strip():
+                    result += f"  {line.strip()}\n"
+            result += "\n"
+
+        if pm2_status:
+            found_on.append("PM2")
+            result += "--- PM2 ---\n"
+            for line in pm2_status.split('\n'):
+                if line.strip():
+                    result += f"  {line.strip()}\n"
+            result += "\n"
+
+        if found_on:
+            result += f"--- Overall: Found on {', '.join(found_on)} ---"
+        else:
+            result += f"Application '{name}' was not found on any platform (Docker, systemd, Kubernetes, PM2)."
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error checking application health: {str(e)}"
+
+
+@mcp.tool()
+async def find_application_errors(name: str, hours: int = 24, platform: str = "auto") -> str:
+    """
+    Search for recent errors in an application's logs across platforms.
+
+    Looks for error, exception, fatal, panic, and critical messages in the
+    application's logs within the specified time window.
+
+    Args:
+        name: Application or service name
+        hours: Hours to look back (1-168, default 24)
+        platform: One of "auto", "docker", "systemd", "kubernetes", "pm2" (default "auto")
+    """
+    try:
+        _sanitize_identifier(name, "name")
+
+        if platform not in ALLOWED_PLATFORMS:
+            return f"Error: platform must be one of {', '.join(sorted(ALLOWED_PLATFORMS))}. Got: '{platform}'"
+
+        if not isinstance(hours, int) or hours < 1 or hours > 168:
+            return "Error: hours must be between 1 and 168"
+
+        quoted_name = shlex.quote(name)
+        error_grep = "grep -iE '(error|exception|fatal|panic|critical|traceback)'"
+
+        platforms_to_try = ["docker", "systemd", "kubernetes", "pm2"] if platform == "auto" else [platform]
+
+        result = f"=== Error Search: {name} (last {hours} hours) ===\n\n"
+        total_errors = 0
+
+        for plat in platforms_to_try:
+            try:
+                if plat == "docker":
+                    output = await run_ssh_command(f"docker logs --since {hours}h {quoted_name} 2>&1 | {error_grep} | tail -30 || echo ''")
+                    if output.strip():
+                        count = len([l for l in output.strip().split('\n') if l.strip()])
+                        total_errors += count
+                        result += f"--- Docker ({count} matches) ---\n{output}\n\n"
+                elif plat == "systemd":
+                    output = await run_ssh_command(f'journalctl -u {quoted_name} --since "{hours} hours ago" -p err --no-pager -n 30 2>/dev/null || echo ""')
+                    if output.strip():
+                        count = len([l for l in output.strip().split('\n') if l.strip()])
+                        total_errors += count
+                        result += f"--- systemd ({count} matches) ---\n{output}\n\n"
+                elif plat == "kubernetes":
+                    pod_output = await run_ssh_command(f"kubectl get pods -A --no-headers 2>/dev/null | grep -i {quoted_name} | head -1")
+                    if pod_output.strip():
+                        parts = pod_output.strip().split()
+                        if len(parts) >= 2:
+                            output = await run_ssh_command(f"kubectl logs {shlex.quote(parts[1])} -n {shlex.quote(parts[0])} --since={hours}h 2>/dev/null | {error_grep} | tail -30 || echo ''")
+                            if output.strip():
+                                count = len([l for l in output.strip().split('\n') if l.strip()])
+                                total_errors += count
+                                result += f"--- Kubernetes ({count} matches) ---\n{output}\n\n"
+                elif plat == "pm2":
+                    output = await run_ssh_command(f"pm2 logs {quoted_name} --lines 500 --nostream 2>/dev/null | {error_grep} | tail -30 || echo ''")
+                    if output.strip():
+                        count = len([l for l in output.strip().split('\n') if l.strip()])
+                        total_errors += count
+                        result += f"--- PM2 ({count} matches) ---\n{output}\n\n"
+            except Exception:
+                continue
+
+        if total_errors == 0:
+            result += f"No errors found for '{name}' in the last {hours} hours."
+        else:
+            result += f"--- Total: {total_errors} error(s) found ---"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error searching application errors: {str(e)}"
+
+
