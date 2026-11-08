@@ -394,3 +394,75 @@ async def restart_service(service_name: str) -> str:
     except Exception as e:
         return f"Error restarting service: {str(e)}"
 
+# ===========================
+# System Health Monitoring Tools
+# ===========================
+
+@mcp.tool()
+async def check_memory_usage() -> str:
+    """
+    Check RAM and swap memory usage on the remote server.
+
+    Returns formatted memory statistics including total, used, free, shared,
+    buff/cache, and available memory for both RAM and swap.
+    """
+    try:
+        output = await run_ssh_command("free -h")
+        return f"Memory usage on remote server:\n\n{output}"
+    except Exception as e:
+        return f"Error checking memory usage: {str(e)}"
+
+
+@mcp.tool()
+async def check_system_load() -> str:
+    """
+    Check system uptime and load averages.
+
+    Returns uptime and 1/5/15 minute load averages. Load averages indicate
+    system activity — values below CPU count are normal, above indicates saturation.
+    """
+    try:
+        output = await run_ssh_command("uptime")
+        return f"System load on remote server:\n\n{output}"
+    except Exception as e:
+        return f"Error checking system load: {str(e)}"
+
+
+@mcp.tool()
+async def check_top_processes(sort_by: str = "memory", limit: int = 10) -> str:
+    """
+    Show top processes sorted by memory or CPU usage.
+
+    Args:
+        sort_by: Sort criterion - "memory" (default) or "cpu"
+        limit: Number of processes to show (1-50, default 10)
+
+    Returns:
+        Top N processes with USER, PID, CPU%, MEM%, VSZ, RSS, TTY, STAT, START, TIME, and COMMAND
+    """
+    try:
+        # Validate limit
+        if not isinstance(limit, int) or limit < 1 or limit > 50:
+            return "Error: limit must be between 1 and 50"
+
+        # Map sort_by to ps sort parameter
+        sort_map = {
+            "memory": "-%mem",
+            "cpu": "-%cpu"
+        }
+
+        if sort_by not in sort_map:
+            return f"Error: sort_by must be 'memory' or 'cpu', got '{sort_by}'"
+
+        sort_param = sort_map[sort_by]
+
+        # Use ps aux with sort and head to get top N processes
+        command = f"ps aux --sort={sort_param} | head -n {limit + 1}"
+        output = await run_ssh_command(command)
+
+        return f"Top {limit} processes by {sort_by}:\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking top processes: {str(e)}"
+
+
