@@ -849,3 +849,344 @@ async def check_recent_logins(lines: int = 20) -> str:
         return f"Error checking recent logins: {str(e)}"
 
 
+# ===========================
+# Runtime & Platform Detection
+# ===========================
+
+@mcp.tool()
+async def detect_runtime_environment() -> str:
+    """
+    Probe the remote server and detect ALL runtime platforms, OS info, and resource summary.
+
+    Runs multiple checks in parallel for speed. Reports which platforms are available
+    (Docker, Kubernetes, systemd, PM2, Supervisor) along with OS details and basic
+    resource usage. This is the recommended first tool to run on a new server.
+    """
+    try:
+        probes = await asyncio.gather(
+            run_ssh_command("cat /etc/os-release 2>/dev/null | head -5"),
+            run_ssh_command("hostname -f 2>/dev/null || hostname"),
+            run_ssh_command("uptime"),
+            run_ssh_command("free -h 2>/dev/null | head -2"),
+            run_ssh_command("df -h / 2>/dev/null | tail -1"),
+            run_ssh_command("nproc 2>/dev/null || echo unknown"),
+            run_ssh_command("docker --version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null || echo ''"),
+            run_ssh_command("docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("kubectl version --client --short 2>/dev/null || kubectl version --client 2>/dev/null | head -1 || echo NOT_INSTALLED"),
+            run_ssh_command("kubectl get pods -A --no-headers 2>/dev/null | wc -l || echo 0"),
+            run_ssh_command("systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | wc -l || echo 0"),
+            run_ssh_command("systemctl list-units --type=service --state=failed --no-pager --no-legend 2>/dev/null | wc -l || echo 0"),
+            run_ssh_command("pm2 --version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("supervisorctl version 2>/dev/null || echo NOT_INSTALLED"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        os_info = safe(0)
+        hostname = safe(1)
+        uptime_info = safe(2)
+        memory_info = safe(3)
+        disk_info = safe(4)
+        cpu_count = safe(5)
+
+        docker_ver = safe(6)
+        docker_containers = safe(7)
+        compose_ver = safe(8)
+        kubectl_ver = safe(9)
+        k8s_pods = safe(10)
+        systemd_running = safe(11)
+        systemd_failed = safe(12)
+        pm2_ver = safe(13)
+        supervisor_ver = safe(14)
+
+        has_docker = "NOT_INSTALLED" not in docker_ver and "unavailable" not in docker_ver
+        has_compose = "NOT_INSTALLED" not in compose_ver and "unavailable" not in compose_ver
+        has_kubectl = "NOT_INSTALLED" not in kubectl_ver and "unavailable" not in kubectl_ver
+        has_pm2 = "NOT_INSTALLED" not in pm2_ver and "unavailable" not in pm2_ver
+        has_supervisor = "NOT_INSTALLED" not in supervisor_ver and "unavailable" not in supervisor_ver
+
+        container_count = len([l for l in docker_containers.split('\n') if l.strip()]) if has_docker and docker_containers else 0
+        running_containers = len([l for l in docker_containers.split('\n') if 'Up' in l]) if has_docker and docker_containers else 0
+
+        result = "=== Server Runtime Environment ===\n\n"
+        result += f"Host:        {hostname}\n"
+
+        os_name = ""
+        for line in os_info.split('\n'):
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split('=', 1)[1].strip('"')
+                break
+        if os_name:
+            result += f"OS:          {os_name}\n"
+
+        result += f"CPUs:        {cpu_count}\n"
+        result += f"Uptime:      {uptime_info}\n"
+        result += f"Memory:      {memory_info}\n"
+        result += f"Root Disk:   {disk_info}\n\n"
+
+        result += "--- Platforms Detected ---\n"
+
+        if has_docker:
+            result += f"  [x] Docker — {docker_ver} ({container_count} containers, {running_containers} running)\n"
+        else:
+            result += "  [ ] Docker — not installed\n"
+
+        if has_compose:
+            result += f"  [x] Docker Compose — {compose_ver}\n"
+        else:
+            result += "  [ ] Docker Compose — not installed\n"
+
+        if has_kubectl:
+            result += f"  [x] Kubernetes — {kubectl_ver} ({k8s_pods} pods across all namespaces)\n"
+        else:
+            result += "  [ ] Kubernetes (kubectl) — not installed\n"
+
+        result += f"  [x] systemd — {systemd_running} services running, {systemd_failed} failed\n"
+
+        if has_pm2:
+            result += f"  [x] PM2 — v{pm2_ver}\n"
+        else:
+            result += "  [ ] PM2 — not installed\n"
+
+        if has_supervisor:
+            result += f"  [x] Supervisor — v{supervisor_ver}\n"
+        else:
+            result += "  [ ] Supervisor — not installed\n"
+
+        if has_docker and docker_containers and container_count > 0:
+            result += "\n--- Docker Containers ---\n"
+            for line in docker_containers.split('\n'):
+                if line.strip():
+                    result += f"  {line}\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting runtime environment: {str(e)}"
+
+
+@mcp.tool()
+async def detect_docker_environment() -> str:
+    """
+    Detailed Docker environment probe.
+
+    Checks Docker installation, daemon status, lists all containers with their
+    status and images, detects Docker Compose and Docker Swarm. Use this for
+    a deep dive into Docker when detect_runtime_environment shows Docker is present.
+    """
+    try:
+        version_output = await run_ssh_command("docker --version 2>/dev/null || echo NOT_INSTALLED")
+
+        if "NOT_INSTALLED" in version_output:
+            return "Docker is not installed on this server."
+
+        probes = await asyncio.gather(
+            run_ssh_command("docker info --format '{{.ServerVersion}}' 2>/dev/null || echo DAEMON_NOT_RUNNING"),
+            run_ssh_command('docker ps -a --format "table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Image}}\\t{{.Ports}}" 2>/dev/null'),
+            run_ssh_command("docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo unknown"),
+            run_ssh_command('docker network ls --format "table {{.Name}}\\t{{.Driver}}\\t{{.Scope}}" 2>/dev/null'),
+            run_ssh_command('docker volume ls --format "table {{.Name}}\\t{{.Driver}}" 2>/dev/null | head -20'),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        daemon_ver = safe(0)
+        containers = safe(1)
+        compose = safe(2)
+        swarm_state = safe(3)
+        networks = safe(4)
+        volumes = safe(5)
+
+        result = "=== Docker Environment ===\n\n"
+        result += f"Docker Version:   {version_output.strip()}\n"
+
+        if "DAEMON_NOT_RUNNING" in daemon_ver:
+            result += "Daemon Status:    NOT RUNNING\n"
+        else:
+            result += f"Daemon Status:    Running (Server v{daemon_ver})\n"
+
+        if "NOT_INSTALLED" not in compose:
+            result += f"Docker Compose:   {compose}\n"
+        else:
+            result += "Docker Compose:   Not installed\n"
+
+        result += f"Swarm State:      {swarm_state}\n\n"
+
+        result += "--- Containers ---\n"
+        result += f"{containers}\n\n" if containers else "  (no containers)\n\n"
+
+        result += "--- Networks ---\n"
+        result += f"{networks}\n\n" if networks else "  (no networks)\n\n"
+
+        result += "--- Volumes (first 20) ---\n"
+        result += f"{volumes}\n" if volumes else "  (no volumes)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting Docker environment: {str(e)}"
+
+
+@mcp.tool()
+async def detect_kubernetes_environment() -> str:
+    """
+    Probe Kubernetes environment via kubectl.
+
+    Checks if kubectl is installed and configured, shows cluster info,
+    namespaces, pods, services, and deployments. Requires kubectl to be
+    available and configured on the remote server.
+    """
+    try:
+        kubectl_check = await run_ssh_command("kubectl version --client --short 2>/dev/null || kubectl version --client 2>/dev/null | head -1 || echo NOT_INSTALLED")
+
+        if "NOT_INSTALLED" in kubectl_check:
+            return "Kubernetes (kubectl) is not installed on this server."
+
+        cluster_check = await run_ssh_command("kubectl cluster-info 2>/dev/null || echo CLUSTER_NOT_REACHABLE")
+
+        if "CLUSTER_NOT_REACHABLE" in cluster_check:
+            return f"kubectl is installed ({kubectl_check.strip()}) but cannot reach a cluster. The kubeconfig may not be set up for this SSH user."
+
+        probes = await asyncio.gather(
+            run_ssh_command("kubectl get namespaces --no-headers 2>/dev/null | head -30"),
+            run_ssh_command("kubectl get pods -A --no-headers 2>/dev/null | head -50"),
+            run_ssh_command("kubectl get services -A --no-headers 2>/dev/null | head -50"),
+            run_ssh_command("kubectl get deployments -A --no-headers 2>/dev/null | head -30"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        namespaces = safe(0)
+        pods = safe(1)
+        services = safe(2)
+        deployments = safe(3)
+
+        result = "=== Kubernetes Environment ===\n\n"
+        result += f"kubectl:     {kubectl_check.strip()}\n"
+        result += f"Cluster:     {cluster_check.strip().split(chr(10))[0]}\n\n"
+
+        result += "--- Namespaces ---\n"
+        result += f"{namespaces}\n\n" if namespaces else "  (none)\n\n"
+
+        result += "--- Pods (first 50) ---\n"
+        result += f"{pods}\n\n" if pods else "  (no pods)\n\n"
+
+        result += "--- Services (first 50) ---\n"
+        result += f"{services}\n\n" if services else "  (no services)\n\n"
+
+        result += "--- Deployments (first 30) ---\n"
+        result += f"{deployments}\n" if deployments else "  (no deployments)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting Kubernetes environment: {str(e)}"
+
+
+@mcp.tool()
+async def detect_systemd_services(state_filter: str = "active") -> str:
+    """
+    List systemd services filtered by state.
+
+    Provides a full inventory of systemd services, unlike check_failed_services
+    which only shows failed units.
+
+    Args:
+        state_filter: One of "active", "failed", "inactive", "all" (default "active")
+    """
+    try:
+        if state_filter not in ALLOWED_SERVICE_STATES:
+            return f"Error: state_filter must be one of {', '.join(sorted(ALLOWED_SERVICE_STATES))}. Got: '{state_filter}'"
+
+        if state_filter == "all":
+            command = "systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null | head -80"
+        else:
+            command = f"systemctl list-units --type=service --state={state_filter} --no-pager --no-legend 2>/dev/null | head -80"
+
+        output = await run_ssh_command(command)
+
+        if not output.strip():
+            return f"No systemd services found with state '{state_filter}'"
+
+        count = len([l for l in output.strip().split('\n') if l.strip()])
+        result = f"=== systemd Services (state: {state_filter}) ===\n\n"
+        result += f"{output}\n\n"
+        result += f"--- Showing {count} service(s) (capped at 80) ---"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting systemd services: {str(e)}"
+
+
+@mcp.tool()
+async def detect_process_managers() -> str:
+    """
+    Detect PM2, Supervisor, and other process managers on the remote server.
+
+    Checks for PM2, Supervisor, and forever. For each detected manager,
+    lists the processes it manages.
+    """
+    try:
+        probes = await asyncio.gather(
+            run_ssh_command("pm2 --version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("pm2 list 2>/dev/null || echo ''"),
+            run_ssh_command("supervisorctl version 2>/dev/null || echo NOT_INSTALLED"),
+            run_ssh_command("supervisorctl status 2>/dev/null || echo ''"),
+            run_ssh_command("forever list 2>/dev/null || echo NOT_INSTALLED"),
+            return_exceptions=True
+        )
+
+        def safe(idx):
+            r = probes[idx]
+            return r.strip() if isinstance(r, str) else "(unavailable)"
+
+        pm2_ver = safe(0)
+        pm2_list = safe(1)
+        supervisor_ver = safe(2)
+        supervisor_status = safe(3)
+        forever_list = safe(4)
+
+        has_pm2 = "NOT_INSTALLED" not in pm2_ver
+        has_supervisor = "NOT_INSTALLED" not in supervisor_ver
+        has_forever = "NOT_INSTALLED" not in forever_list
+
+        if not has_pm2 and not has_supervisor and not has_forever:
+            return "No additional process managers detected (PM2, Supervisor, forever are not installed)."
+
+        result = "=== Process Managers Detected ===\n\n"
+
+        if has_pm2:
+            result += f"--- PM2 (v{pm2_ver}) ---\n"
+            result += f"{pm2_list}\n\n" if pm2_list else "  (no processes)\n\n"
+        else:
+            result += "--- PM2 ---\n  Not installed\n\n"
+
+        if has_supervisor:
+            result += f"--- Supervisor (v{supervisor_ver}) ---\n"
+            result += f"{supervisor_status}\n\n" if supervisor_status else "  (no processes)\n\n"
+        else:
+            result += "--- Supervisor ---\n  Not installed\n\n"
+
+        if has_forever:
+            result += f"--- forever ---\n{forever_list}\n"
+        else:
+            result += "--- forever ---\n  Not installed\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error detecting process managers: {str(e)}"
+
+
