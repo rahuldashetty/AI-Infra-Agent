@@ -2094,3 +2094,1030 @@ async def check_docker_compose_services(project_dir: str = None) -> str:
         return f"Error checking Docker Compose services: {str(e)}"
 
 
+# ======================================
+# Junior DevOps Workflow Tools
+# Smart diagnostic chains that investigate
+# issues like a junior DevOps engineer
+# ======================================
+
+
+@mcp.tool()
+async def diagnose_http_error(app_name: str, port: int = 80, error_code: int = 500) -> str:
+    """
+    Diagnose HTTP errors by running a full investigation like a junior DevOps engineer.
+
+    Checks: app process status, logs for errors, port binding, database connectivity,
+    disk/memory/CPU, and Docker container health (if applicable).
+
+    Args:
+        app_name: Name of the application to investigate (e.g., "nginx", "my-api")
+        port: Port the application should be listening on (default 80)
+        error_code: HTTP error code being investigated (default 500)
+    """
+    try:
+        _sanitize_identifier(app_name, "app_name")
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return "Error: port must be between 1 and 65535"
+        if not isinstance(error_code, int) or error_code < 400 or error_code > 599:
+            return "Error: error_code must be between 400 and 599"
+
+        safe_name = shlex.quote(app_name)
+        safe_port = str(port)
+
+        checks = await asyncio.gather(
+            run_ssh_command(f"docker ps -a --filter name={safe_name} --format '{{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.State}}}}' 2>/dev/null || echo 'Docker not available'"),
+            run_ssh_command(f"systemctl is-active {safe_name} 2>/dev/null || echo 'not a systemd service'"),
+            run_ssh_command(f"pgrep -a {safe_name} 2>/dev/null | head -5 || echo 'no process found'"),
+            run_ssh_command(f"ss -tlnp 2>/dev/null | grep :{safe_port} || echo 'port {safe_port} not listening'"),
+            run_ssh_command(f"docker logs --tail 50 {safe_name} 2>/dev/null | grep -iE 'error|exception|fatal|panic|traceback|refused|timeout' | tail -20 || echo 'no docker logs'"),
+            run_ssh_command(f"journalctl -u {safe_name} --no-pager -n 50 --since '1 hour ago' 2>/dev/null | grep -iE 'error|exception|fatal|panic|traceback|refused|timeout' | tail -20 || echo 'no journal errors'"),
+            run_ssh_command("df -h / | tail -1"),
+            run_ssh_command("free -m | grep Mem"),
+            run_ssh_command("uptime"),
+            run_ssh_command("nproc"),
+            run_ssh_command("dmesg 2>/dev/null | grep -i oom | tail -5 || echo 'no OOM events'"),
+            run_ssh_command(f"docker inspect --format='{{{{.State.ExitCode}}}} {{{{.State.OOMKilled}}}} {{{{.RestartCount}}}}' {safe_name} 2>/dev/null || echo 'no docker inspect'"),
+            return_exceptions=True
+        )
+
+        docker_ps = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        systemd_status = str(checks[1]) if not isinstance(checks[1], Exception) else "check failed"
+        process_check = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        port_check = str(checks[3]) if not isinstance(checks[3], Exception) else "check failed"
+        docker_errors = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        journal_errors = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        disk_check = str(checks[6]) if not isinstance(checks[6], Exception) else "check failed"
+        mem_check = str(checks[7]) if not isinstance(checks[7], Exception) else "check failed"
+        load_check = str(checks[8]) if not isinstance(checks[8], Exception) else "check failed"
+        cpu_count = str(checks[9]) if not isinstance(checks[9], Exception) else "?"
+        oom_check = str(checks[10]) if not isinstance(checks[10], Exception) else "check failed"
+        docker_inspect = str(checks[11]) if not isinstance(checks[11], Exception) else "check failed"
+
+        findings = []
+
+        app_running = False
+        if "not available" not in docker_ps and docker_ps.strip() and "no" not in docker_ps.lower():
+            app_running = "Up" in docker_ps
+            if not app_running:
+                findings.append(("CRITICAL", f"Docker container '{app_name}' is NOT running", docker_ps))
+            else:
+                findings.append(("OK", f"Docker container '{app_name}' is running", docker_ps))
+        elif systemd_status.strip() == "active":
+            app_running = True
+            findings.append(("OK", f"Systemd service '{app_name}' is active", ""))
+        elif "no process found" not in process_check:
+            app_running = True
+            findings.append(("OK", f"Process '{app_name}' found", process_check))
+        else:
+            findings.append(("CRITICAL", f"Application '{app_name}' is NOT running on any platform", "No Docker container, systemd service, or process found"))
+
+        if f"port {safe_port} not listening" in port_check:
+            findings.append(("CRITICAL", f"Port {port} is NOT listening", "No process bound to this port"))
+        else:
+            findings.append(("OK", f"Port {port} is listening", port_check.strip()))
+
+        if "no docker logs" not in docker_errors and docker_errors.strip():
+            findings.append(("WARNING", "Errors found in Docker logs", docker_errors[:500]))
+        if "no journal errors" not in journal_errors and journal_errors.strip():
+            findings.append(("WARNING", "Errors found in journal logs", journal_errors[:500]))
+
+        try:
+            disk_parts = disk_check.split()
+            if len(disk_parts) >= 5:
+                usage_pct = int(disk_parts[4].replace('%', ''))
+                if usage_pct >= 95:
+                    findings.append(("CRITICAL", f"Disk usage at {usage_pct}%", disk_check))
+                elif usage_pct >= 85:
+                    findings.append(("WARNING", f"Disk usage at {usage_pct}%", disk_check))
+                else:
+                    findings.append(("OK", f"Disk usage at {usage_pct}%", ""))
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            mem_parts = mem_check.split()
+            if len(mem_parts) >= 3:
+                total_mem = int(mem_parts[1])
+                used_mem = int(mem_parts[2])
+                mem_pct = (used_mem / total_mem * 100) if total_mem > 0 else 0
+                if mem_pct >= 95:
+                    findings.append(("CRITICAL", f"Memory usage at {mem_pct:.0f}%", f"{used_mem}MB / {total_mem}MB"))
+                elif mem_pct >= 85:
+                    findings.append(("WARNING", f"Memory usage at {mem_pct:.0f}%", f"{used_mem}MB / {total_mem}MB"))
+                else:
+                    findings.append(("OK", f"Memory usage at {mem_pct:.0f}%", ""))
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            load_parts = load_check.split("load average:")
+            if len(load_parts) > 1:
+                load_1min = float(load_parts[1].split(",")[0].strip())
+                cores = int(cpu_count.strip()) if cpu_count.strip().isdigit() else 1
+                load_ratio = load_1min / cores
+                if load_ratio >= 2.0:
+                    findings.append(("CRITICAL", f"CPU load {load_1min:.1f} ({load_ratio:.1f}x cores)", f"{cores} CPU cores"))
+                elif load_ratio >= 1.0:
+                    findings.append(("WARNING", f"CPU load {load_1min:.1f} ({load_ratio:.1f}x cores)", f"{cores} CPU cores"))
+                else:
+                    findings.append(("OK", f"CPU load {load_1min:.1f} ({load_ratio:.1f}x cores)", ""))
+        except (ValueError, IndexError):
+            pass
+
+        if "no OOM events" not in oom_check and oom_check.strip():
+            findings.append(("CRITICAL", "OOM killer events detected", oom_check[:300]))
+
+        if "no docker inspect" not in docker_inspect:
+            parts = docker_inspect.strip().split()
+            if len(parts) >= 3:
+                exit_code = parts[0]
+                oom_killed = parts[1]
+                restart_count = parts[2]
+                if oom_killed.lower() == "true":
+                    findings.append(("CRITICAL", "Container was OOMKilled", f"Exit code: {exit_code}, Restarts: {restart_count}"))
+                elif exit_code not in ("0", ""):
+                    exit_meanings = {"137": "OOM/SIGKILL", "139": "Segfault", "143": "SIGTERM", "1": "App error", "126": "Permission denied", "127": "Command not found"}
+                    meaning = exit_meanings.get(exit_code, "Unknown")
+                    findings.append(("WARNING", f"Container exit code {exit_code} ({meaning})", f"Restarts: {restart_count}"))
+
+        severity_order = {"CRITICAL": 0, "WARNING": 1, "OK": 2}
+        findings.sort(key=lambda x: severity_order.get(x[0], 3))
+
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: HTTP {error_code} — {app_name}:{port}\n"
+        result += f"{'='*60}\n\n"
+
+        if critical_count > 0:
+            result += f"  STATUS: CRITICAL ({critical_count} critical, {warning_count} warnings)\n\n"
+        elif warning_count > 0:
+            result += f"  STATUS: WARNING ({warning_count} warnings)\n\n"
+        else:
+            result += f"  STATUS: OK (no issues detected)\n\n"
+
+        result += "--- Findings ---\n\n"
+        for severity, message, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(severity, "?")
+            result += f"  [{severity}] {icon} {message}\n"
+            if detail:
+                for line in detail.strip().split('\n')[:3]:
+                    result += f"           {line}\n"
+            result += "\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if not app_running:
+            result += "  1. Check why the application stopped (exit code, logs)\n"
+            result += "  2. Attempt to restart the application\n"
+            result += "  3. Monitor logs after restart for immediate errors\n"
+        elif f"port {safe_port} not listening" in port_check:
+            result += "  1. Verify the application is configured to listen on port {port}\n"
+            result += "  2. Check for port conflicts with other services\n"
+            result += "  3. Review application startup logs for binding errors\n"
+        elif critical_count > 0:
+            result += "  1. Address CRITICAL findings above\n"
+            result += "  2. Check application logs for the root cause\n"
+            result += "  3. Consider restarting the application after fixing issues\n"
+        else:
+            result += "  1. Review application-level error handling\n"
+            result += "  2. Check upstream dependencies (databases, APIs)\n"
+            result += "  3. Review recent code deployments\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error diagnosing HTTP error: {str(e)}"
+
+
+@mcp.tool()
+async def diagnose_container_crash(container_name: str) -> str:
+    """
+    Diagnose why a Docker container keeps crashing or exiting.
+
+    Analyzes exit codes (137=OOM, 139=segfault, 143=SIGTERM, 1=app error),
+    checks OOMKilled status, memory limits, host resources, and recent logs.
+
+    Args:
+        container_name: Name of the Docker container to investigate
+    """
+    try:
+        _sanitize_identifier(container_name, "container_name")
+        safe_name = shlex.quote(container_name)
+
+        checks = await asyncio.gather(
+            run_ssh_command(f"docker inspect --format='ExitCode:{{{{.State.ExitCode}}}} OOMKilled:{{{{.State.OOMKilled}}}} Status:{{{{.State.Status}}}} StartedAt:{{{{.State.StartedAt}}}} FinishedAt:{{{{.State.FinishedAt}}}} RestartCount:{{{{.RestartCount}}}}' {safe_name} 2>/dev/null || echo 'container not found'"),
+            run_ssh_command(f"docker logs --tail 100 {safe_name} 2>&1 | tail -100"),
+            run_ssh_command(f"docker stats --no-stream --format 'CPU:{{{{.CPUPerc}}}} MEM:{{{{.MemUsage}}}} NET:{{{{.NetIO}}}}' {safe_name} 2>/dev/null || echo 'container not running'"),
+            run_ssh_command(f"docker inspect --format='MemoryLimit:{{{{.HostConfig.Memory}}}} MemorySwap:{{{{.HostConfig.MemorySwap}}}} CpuShares:{{{{.HostConfig.CpuShares}}}} CpuQuota:{{{{.HostConfig.CpuQuota}}}}' {safe_name} 2>/dev/null || echo 'no limits info'"),
+            run_ssh_command("free -m | grep -E 'Mem|Swap'"),
+            run_ssh_command("dmesg 2>/dev/null | grep -iE 'oom|killed process|out of memory' | tail -10 || echo 'no OOM events'"),
+            run_ssh_command(f"docker inspect --format='Image:{{{{.Config.Image}}}} Cmd:{{{{.Config.Cmd}}}}' {safe_name} 2>/dev/null || echo 'no image info'"),
+            return_exceptions=True
+        )
+
+        inspect_out = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        logs_out = str(checks[1]) if not isinstance(checks[1], Exception) else "no logs"
+        stats_out = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        limits_out = str(checks[3]) if not isinstance(checks[3], Exception) else "check failed"
+        host_mem = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        oom_events = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        image_info = str(checks[6]) if not isinstance(checks[6], Exception) else "check failed"
+
+        if "container not found" in inspect_out:
+            return f"Container '{container_name}' not found. Run 'docker ps -a' to list all containers."
+
+        exit_code = ""
+        oom_killed = ""
+        status = ""
+        restart_count = ""
+        for part in inspect_out.split():
+            if part.startswith("ExitCode:"):
+                exit_code = part.split(":")[1]
+            elif part.startswith("OOMKilled:"):
+                oom_killed = part.split(":")[1]
+            elif part.startswith("Status:"):
+                status = part.split(":")[1]
+            elif part.startswith("RestartCount:"):
+                restart_count = part.split(":")[1]
+
+        exit_meanings = {
+            "0": ("Normal exit", "OK"),
+            "1": ("Application error", "CRITICAL"),
+            "2": ("Misuse of shell command", "CRITICAL"),
+            "126": ("Command not executable (permission denied)", "CRITICAL"),
+            "127": ("Command not found", "CRITICAL"),
+            "137": ("SIGKILL (likely OOM or manual kill)", "CRITICAL"),
+            "139": ("Segmentation fault (SIGSEGV)", "CRITICAL"),
+            "143": ("SIGTERM (graceful shutdown)", "WARNING"),
+        }
+        meaning, severity = exit_meanings.get(exit_code, (f"Unknown exit code {exit_code}", "WARNING"))
+
+        findings = []
+
+        if oom_killed.lower() == "true":
+            findings.append(("CRITICAL", "Container was killed by OOM (Out of Memory)", "The kernel terminated this container because it exceeded its memory limit"))
+        elif exit_code == "137":
+            findings.append(("CRITICAL", "Container received SIGKILL (exit 137)", "Likely OOM kill or manual 'docker kill'. Check memory limits and host OOM events"))
+        elif exit_code == "139":
+            findings.append(("CRITICAL", "Container crashed with segmentation fault (exit 139)", "Application has a memory access bug. Check for native library issues"))
+        elif exit_code == "1":
+            findings.append(("CRITICAL", "Application error (exit 1)", "The application exited with an error. Check logs below"))
+        elif exit_code != "0":
+            findings.append(("WARNING", f"Unexpected exit code: {exit_code} ({meaning})", ""))
+
+        if status == "running":
+            findings.append(("OK", "Container is currently running", f"Restart count: {restart_count}"))
+        elif status == "restarting":
+            findings.append(("WARNING", "Container is in restart loop", f"Restart count: {restart_count}"))
+        else:
+            findings.append(("CRITICAL", f"Container status: {status}", f"Restart count: {restart_count}"))
+
+        if int(restart_count) > 5 if restart_count.isdigit() else False:
+            findings.append(("WARNING", f"High restart count: {restart_count}", "Container may be in a crash loop"))
+
+        if "no OOM events" not in oom_events and oom_events.strip():
+            findings.append(("CRITICAL", "Host-level OOM events detected", oom_events[:300]))
+
+        error_lines = [l for l in logs_out.split('\n') if any(p in l.lower() for p in ['error', 'exception', 'fatal', 'panic', 'traceback', 'killed'])]
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: Container Crash — {container_name}\n"
+        result += f"{'='*60}\n\n"
+
+        result += "--- Container State ---\n"
+        result += f"  Status:        {status}\n"
+        result += f"  Exit Code:     {exit_code} ({meaning})\n"
+        result += f"  OOM Killed:    {oom_killed}\n"
+        result += f"  Restart Count: {restart_count}\n"
+        result += f"  Image:         {image_info}\n\n"
+
+        result += "--- Resource Usage ---\n"
+        result += f"  Container:     {stats_out}\n"
+        result += f"  Limits:        {limits_out}\n"
+        result += f"  Host Memory:   {host_mem}\n\n"
+
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result += "--- Findings ---\n\n"
+        findings.sort(key=lambda x: {"CRITICAL": 0, "WARNING": 1, "OK": 2}.get(x[0], 3))
+        for sev, msg, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(sev, "?")
+            result += f"  [{sev}] {icon} {msg}\n"
+            if detail:
+                result += f"           {detail}\n"
+            result += "\n"
+
+        result += "--- Recent Error Logs ---\n\n"
+        if error_lines:
+            for line in error_lines[-15:]:
+                result += f"  {line}\n"
+        else:
+            result += "  No error patterns found in recent logs\n"
+        result += "\n"
+
+        result += "--- Last 20 Log Lines ---\n\n"
+        for line in logs_out.split('\n')[-20:]:
+            result += f"  {line}\n"
+        result += "\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if oom_killed.lower() == "true" or exit_code == "137":
+            result += "  1. Increase container memory limit\n"
+            result += "  2. Check for memory leaks in the application\n"
+            result += "  3. Monitor memory usage over time with 'docker stats'\n"
+        elif exit_code == "139":
+            result += "  1. Check for incompatible native libraries\n"
+            result += "  2. Update base image and dependencies\n"
+            result += "  3. Run with debugging tools to identify the crash point\n"
+        elif exit_code == "1":
+            result += "  1. Review error logs above for the root cause\n"
+            result += "  2. Check environment variables and configuration\n"
+            result += "  3. Verify all dependencies are available (DB, Redis, etc.)\n"
+        else:
+            result += "  1. Review logs for error patterns\n"
+            result += "  2. Check container resource limits\n"
+            result += "  3. Verify the application starts correctly locally\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error diagnosing container crash: {str(e)}"
+
+
+@mcp.tool()
+async def diagnose_high_resource_usage(resource: str = "auto") -> str:
+    """
+    Diagnose high resource usage on the server — CPU, memory, disk, or all.
+
+    Identifies bottlenecks by checking load averages, memory/swap, disk usage,
+    top consumers, I/O wait, and kernel errors.
+
+    Args:
+        resource: Resource to investigate — "auto", "cpu", "memory", "disk", or "all" (default "auto")
+    """
+    try:
+        if resource not in ALLOWED_RESOURCES:
+            return f"Error: resource must be one of {', '.join(sorted(ALLOWED_RESOURCES))}"
+
+        checks = await asyncio.gather(
+            run_ssh_command("uptime"),
+            run_ssh_command("nproc"),
+            run_ssh_command("free -m"),
+            run_ssh_command("df -h"),
+            run_ssh_command("ps aux --sort=-%cpu | head -11"),
+            run_ssh_command("ps aux --sort=-%mem | head -11"),
+            run_ssh_command("iostat -x 1 2 2>/dev/null | tail -20 || echo 'iostat not available'"),
+            run_ssh_command("vmstat 1 3 2>/dev/null || echo 'vmstat not available'"),
+            run_ssh_command("dmesg 2>/dev/null | grep -iE 'oom|killed|error|i/o' | tail -10 || echo 'no kernel issues'"),
+            run_ssh_command("cat /proc/meminfo 2>/dev/null | grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree|Dirty|Writeback' || echo 'meminfo not available'"),
+            return_exceptions=True
+        )
+
+        uptime = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        cpu_count = str(checks[1]) if not isinstance(checks[1], Exception) else "1"
+        free_out = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        df_out = str(checks[3]) if not isinstance(checks[3], Exception) else "check failed"
+        top_cpu = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        top_mem = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        iostat_out = str(checks[6]) if not isinstance(checks[6], Exception) else "not available"
+        vmstat_out = str(checks[7]) if not isinstance(checks[7], Exception) else "not available"
+        dmesg_out = str(checks[8]) if not isinstance(checks[8], Exception) else "check failed"
+        meminfo = str(checks[9]) if not isinstance(checks[9], Exception) else "not available"
+
+        findings = []
+        bottleneck = None
+
+        try:
+            load_parts = uptime.split("load average:")
+            if len(load_parts) > 1:
+                loads = [float(x.strip().rstrip(',')) for x in load_parts[1].split(",")[:3]]
+                cores = int(cpu_count.strip()) if cpu_count.strip().isdigit() else 1
+                load_1, load_5, load_15 = loads[0], loads[1], loads[2]
+                ratio = load_1 / cores
+
+                if ratio >= 3.0:
+                    findings.append(("CRITICAL", f"CPU overloaded: load {load_1:.1f} is {ratio:.1f}x the {cores} cores", f"1m: {load_1:.1f}, 5m: {load_5:.1f}, 15m: {load_15:.1f}"))
+                    bottleneck = "cpu"
+                elif ratio >= 1.5:
+                    findings.append(("WARNING", f"CPU load high: {load_1:.1f} ({ratio:.1f}x cores)", f"1m: {load_1:.1f}, 5m: {load_5:.1f}, 15m: {load_15:.1f}"))
+                    bottleneck = "cpu"
+                else:
+                    findings.append(("OK", f"CPU load normal: {load_1:.1f} ({ratio:.1f}x {cores} cores)", ""))
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            for line in free_out.split('\n'):
+                if line.startswith("Mem:"):
+                    parts = line.split()
+                    total = int(parts[1])
+                    used = int(parts[2])
+                    available = int(parts[6]) if len(parts) > 6 else total - used
+                    pct = (total - available) / total * 100 if total > 0 else 0
+                    if pct >= 95:
+                        findings.append(("CRITICAL", f"Memory critically low: {pct:.0f}% used", f"{used}MB used / {total}MB total, {available}MB available"))
+                        if not bottleneck:
+                            bottleneck = "memory"
+                    elif pct >= 85:
+                        findings.append(("WARNING", f"Memory usage high: {pct:.0f}% used", f"{used}MB used / {total}MB total, {available}MB available"))
+                        if not bottleneck:
+                            bottleneck = "memory"
+                    else:
+                        findings.append(("OK", f"Memory OK: {pct:.0f}% used ({available}MB available)", ""))
+                elif line.startswith("Swap:"):
+                    parts = line.split()
+                    swap_total = int(parts[1])
+                    swap_used = int(parts[2])
+                    if swap_total > 0:
+                        swap_pct = swap_used / swap_total * 100
+                        if swap_pct >= 80:
+                            findings.append(("WARNING", f"Swap heavily used: {swap_pct:.0f}%", f"{swap_used}MB / {swap_total}MB"))
+                        elif swap_used > 0:
+                            findings.append(("OK", f"Swap in use: {swap_pct:.0f}%", f"{swap_used}MB / {swap_total}MB"))
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            for line in df_out.split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    usage_str = parts[4].replace('%', '')
+                    if usage_str.isdigit():
+                        usage = int(usage_str)
+                        mount = parts[5] if len(parts) > 5 else parts[4]
+                        if usage >= 95:
+                            findings.append(("CRITICAL", f"Disk critically full: {mount} at {usage}%", f"{parts[2]} used / {parts[1]} total"))
+                            if not bottleneck:
+                                bottleneck = "disk"
+                        elif usage >= 85:
+                            findings.append(("WARNING", f"Disk usage high: {mount} at {usage}%", f"{parts[2]} used / {parts[1]} total"))
+        except (ValueError, IndexError):
+            pass
+
+        if "no kernel issues" not in dmesg_out and dmesg_out.strip():
+            findings.append(("WARNING", "Kernel issues detected", dmesg_out[:300]))
+
+        findings.sort(key=lambda x: {"CRITICAL": 0, "WARNING": 1, "OK": 2}.get(x[0], 3))
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: Resource Usage Analysis\n"
+        result += f"{'='*60}\n\n"
+
+        if critical_count > 0:
+            result += f"  STATUS: CRITICAL ({critical_count} critical, {warning_count} warnings)\n"
+            result += f"  BOTTLENECK: {(bottleneck or 'multiple').upper()}\n\n"
+        elif warning_count > 0:
+            result += f"  STATUS: WARNING ({warning_count} warnings)\n"
+            if bottleneck:
+                result += f"  BOTTLENECK: {bottleneck.upper()}\n\n"
+            else:
+                result += "\n"
+        else:
+            result += f"  STATUS: OK (no resource issues detected)\n\n"
+
+        result += "--- Findings ---\n\n"
+        for sev, msg, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(sev, "?")
+            result += f"  [{sev}] {icon} {msg}\n"
+            if detail:
+                result += f"           {detail}\n"
+            result += "\n"
+
+        if resource in ("auto", "cpu", "all"):
+            result += "--- Top CPU Consumers ---\n\n"
+            for line in top_cpu.split('\n')[:11]:
+                result += f"  {line}\n"
+            result += "\n"
+
+        if resource in ("auto", "memory", "all"):
+            result += "--- Top Memory Consumers ---\n\n"
+            for line in top_mem.split('\n')[:11]:
+                result += f"  {line}\n"
+            result += "\n"
+
+        if resource in ("auto", "disk", "all") and "not available" not in iostat_out:
+            result += "--- Disk I/O ---\n\n"
+            for line in iostat_out.split('\n'):
+                result += f"  {line}\n"
+            result += "\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if bottleneck == "cpu":
+            result += "  1. Identify the top CPU-consuming processes above\n"
+            result += "  2. Check if any process is stuck or in a loop\n"
+            result += "  3. Consider scaling horizontally or optimizing hot paths\n"
+        elif bottleneck == "memory":
+            result += "  1. Check the top memory consumers above for leaks\n"
+            result += "  2. Look for processes with growing RSS over time\n"
+            result += "  3. Consider increasing swap or server memory\n"
+        elif bottleneck == "disk":
+            result += "  1. Find large files: du -sh /* | sort -rh | head -20\n"
+            result += "  2. Check and rotate log files\n"
+            result += "  3. Clean up old Docker images: docker system prune\n"
+        else:
+            result += "  1. Continue monitoring for trends\n"
+            result += "  2. Set up alerts for resource thresholds\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error diagnosing resource usage: {str(e)}"
+
+
+@mcp.tool()
+async def diagnose_service_down(service_name: str, port: int = None) -> str:
+    """
+    Diagnose why a service is down or not responding.
+
+    Searches across Docker, systemd, Kubernetes, and PM2. Checks process status,
+    logs, port binding, dependencies, and resource constraints.
+
+    Args:
+        service_name: Name of the service to investigate
+        port: Optional port the service should be listening on
+    """
+    try:
+        _sanitize_identifier(service_name, "service_name")
+        if port is not None and (not isinstance(port, int) or port < 1 or port > 65535):
+            return "Error: port must be between 1 and 65535"
+
+        safe_name = shlex.quote(service_name)
+        port_check_cmd = f"ss -tlnp 2>/dev/null | grep :{port}" if port else "echo 'no port specified'"
+
+        checks = await asyncio.gather(
+            run_ssh_command(f"docker ps -a --filter name={safe_name} --format '{{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.State}}}}\\t{{{{.Ports}}}}' 2>/dev/null || echo 'docker not available'"),
+            run_ssh_command(f"systemctl is-active {safe_name} 2>/dev/null; echo '---'; systemctl show {safe_name} --property=ActiveState,SubState,MainPID,ExecMainStatus 2>/dev/null || echo 'not a systemd service'"),
+            run_ssh_command(f"kubectl get pods -A -l app={safe_name} --no-headers 2>/dev/null || echo 'kubernetes not available'"),
+            run_ssh_command(f"pm2 show {safe_name} 2>/dev/null || echo 'pm2 not available'"),
+            run_ssh_command(f"pgrep -a {safe_name} 2>/dev/null | head -10 || echo 'no process found'"),
+            run_ssh_command(port_check_cmd),
+            run_ssh_command(f"docker logs --tail 50 {safe_name} 2>&1 | tail -50 || echo 'no docker logs'"),
+            run_ssh_command(f"journalctl -u {safe_name} --no-pager -n 50 --since '1 hour ago' 2>/dev/null || echo 'no journal logs'"),
+            run_ssh_command("free -m | grep Mem"),
+            run_ssh_command("df -h / | tail -1"),
+            run_ssh_command("uptime"),
+            return_exceptions=True
+        )
+
+        docker_out = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        systemd_out = str(checks[1]) if not isinstance(checks[1], Exception) else "check failed"
+        k8s_out = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        pm2_out = str(checks[3]) if not isinstance(checks[3], Exception) else "check failed"
+        process_out = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        port_out = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        docker_logs = str(checks[6]) if not isinstance(checks[6], Exception) else "no logs"
+        journal_logs = str(checks[7]) if not isinstance(checks[7], Exception) else "no logs"
+        mem_out = str(checks[8]) if not isinstance(checks[8], Exception) else "check failed"
+        disk_out = str(checks[9]) if not isinstance(checks[9], Exception) else "check failed"
+        load_out = str(checks[10]) if not isinstance(checks[10], Exception) else "check failed"
+
+        findings = []
+        platform_found = None
+        service_running = False
+        relevant_logs = ""
+
+        if "not available" not in docker_out and docker_out.strip():
+            platform_found = "Docker"
+            if "Up" in docker_out:
+                service_running = True
+                findings.append(("OK", f"Docker container '{service_name}' is running", docker_out.strip()))
+            else:
+                findings.append(("CRITICAL", f"Docker container '{service_name}' exists but is NOT running", docker_out.strip()))
+            relevant_logs = docker_logs
+
+        if not platform_found and "not a systemd service" not in systemd_out:
+            systemd_lines = systemd_out.split("---")
+            active_state = systemd_lines[0].strip() if systemd_lines else ""
+            if active_state == "active":
+                platform_found = "systemd"
+                service_running = True
+                findings.append(("OK", f"Systemd service '{service_name}' is active", systemd_out.strip()))
+            elif active_state in ("failed", "inactive"):
+                platform_found = "systemd"
+                findings.append(("CRITICAL", f"Systemd service '{service_name}' is {active_state}", systemd_out.strip()))
+            relevant_logs = journal_logs
+
+        if not platform_found and "not available" not in k8s_out and k8s_out.strip():
+            platform_found = "Kubernetes"
+            if "Running" in k8s_out:
+                service_running = True
+                findings.append(("OK", f"Kubernetes pod for '{service_name}' is running", k8s_out.strip()))
+            else:
+                findings.append(("CRITICAL", f"Kubernetes pod for '{service_name}' has issues", k8s_out.strip()))
+
+        if not platform_found and "not available" not in pm2_out and "not found" not in pm2_out.lower():
+            platform_found = "PM2"
+            if "online" in pm2_out.lower():
+                service_running = True
+                findings.append(("OK", f"PM2 process '{service_name}' is online", ""))
+            else:
+                findings.append(("CRITICAL", f"PM2 process '{service_name}' is not online", pm2_out[:200]))
+
+        if not platform_found:
+            if "no process found" not in process_out:
+                platform_found = "process"
+                service_running = True
+                findings.append(("OK", f"Process '{service_name}' found running", process_out.strip()))
+            else:
+                findings.append(("CRITICAL", f"Service '{service_name}' not found on any platform", "Checked: Docker, systemd, Kubernetes, PM2, and process list"))
+
+        if port:
+            if "no port specified" not in port_out and port_out.strip():
+                findings.append(("OK", f"Port {port} is listening", port_out.strip()))
+            else:
+                findings.append(("CRITICAL" if service_running else "WARNING", f"Port {port} is NOT listening", ""))
+
+        error_lines = []
+        for log_source in [relevant_logs, journal_logs if relevant_logs != journal_logs else ""]:
+            for line in log_source.split('\n'):
+                if any(p in line.lower() for p in ['error', 'exception', 'fatal', 'panic', 'refused', 'timeout', 'traceback']):
+                    error_lines.append(line)
+        if error_lines:
+            findings.append(("WARNING", f"Found {len(error_lines)} error lines in logs", "\n".join(error_lines[-5:])))
+
+        try:
+            parts = mem_out.split()
+            if len(parts) >= 3:
+                total = int(parts[1])
+                used = int(parts[2])
+                pct = used / total * 100 if total > 0 else 0
+                if pct >= 95:
+                    findings.append(("CRITICAL", f"Server memory critically low: {pct:.0f}%", f"{used}MB / {total}MB"))
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            disk_parts = disk_out.split()
+            if len(disk_parts) >= 5:
+                usage = int(disk_parts[4].replace('%', ''))
+                if usage >= 95:
+                    findings.append(("CRITICAL", f"Disk critically full: {usage}%", disk_out))
+        except (ValueError, IndexError):
+            pass
+
+        findings.sort(key=lambda x: {"CRITICAL": 0, "WARNING": 1, "OK": 2}.get(x[0], 3))
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: Service Down — {service_name}\n"
+        result += f"{'='*60}\n\n"
+
+        result += f"  Platform: {platform_found or 'NOT FOUND'}\n"
+        result += f"  Running:  {'Yes' if service_running else 'No'}\n"
+        if port:
+            result += f"  Port:     {port}\n"
+        result += "\n"
+
+        if critical_count > 0:
+            result += f"  STATUS: CRITICAL ({critical_count} critical, {warning_count} warnings)\n\n"
+        elif warning_count > 0:
+            result += f"  STATUS: WARNING ({warning_count} warnings)\n\n"
+        else:
+            result += f"  STATUS: OK (service appears healthy)\n\n"
+
+        result += "--- Findings ---\n\n"
+        for sev, msg, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(sev, "?")
+            result += f"  [{sev}] {icon} {msg}\n"
+            if detail:
+                for line in str(detail).strip().split('\n')[:3]:
+                    result += f"           {line}\n"
+            result += "\n"
+
+        if relevant_logs and "no" not in relevant_logs[:20].lower():
+            result += "--- Recent Logs ---\n\n"
+            for line in relevant_logs.split('\n')[-15:]:
+                result += f"  {line}\n"
+            result += "\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if not service_running and not platform_found:
+            result += "  1. Verify the service name is correct\n"
+            result += "  2. Check if the service was ever deployed to this server\n"
+            result += "  3. Check deployment logs or CI/CD pipeline\n"
+        elif not service_running:
+            result += f"  1. Check {platform_found} logs for crash reason\n"
+            result += f"  2. Try restarting the service on {platform_found}\n"
+            result += "  3. Verify configuration and environment variables\n"
+        elif port and f"Port {port} is NOT listening" in str(findings):
+            result += "  1. Verify the service is configured for the correct port\n"
+            result += "  2. Check for port conflicts\n"
+            result += "  3. Review startup logs for binding errors\n"
+        else:
+            result += "  1. Service appears running — check application-level health\n"
+            result += "  2. Test connectivity from the client side\n"
+            result += "  3. Check upstream dependencies\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error diagnosing service: {str(e)}"
+
+
+@mcp.tool()
+async def diagnose_deployment_issue(app_name: str, platform: str = "auto") -> str:
+    """
+    Diagnose issues after a deployment — app won't start, crashes on startup, etc.
+
+    Checks container age, startup logs, common deployment failures (port conflicts,
+    missing env vars, permission errors, migration failures).
+
+    Args:
+        app_name: Name of the application
+        platform: Platform to check — "auto", "docker", "systemd", "kubernetes", or "pm2"
+    """
+    try:
+        _sanitize_identifier(app_name, "app_name")
+        if platform not in ALLOWED_PLATFORMS:
+            return f"Error: platform must be one of {', '.join(sorted(ALLOWED_PLATFORMS))}"
+
+        safe_name = shlex.quote(app_name)
+
+        checks = await asyncio.gather(
+            run_ssh_command(f"docker inspect --format='Created:{{{{.Created}}}} StartedAt:{{{{.State.StartedAt}}}} Status:{{{{.State.Status}}}} ExitCode:{{{{.State.ExitCode}}}} RestartCount:{{{{.RestartCount}}}}' {safe_name} 2>/dev/null || echo 'no docker container'"),
+            run_ssh_command(f"docker logs --tail 80 {safe_name} 2>&1 | head -80 || echo 'no docker logs'"),
+            run_ssh_command(f"systemctl show {safe_name} --property=ActiveState,SubState,ExecMainStartTimestamp,ExecMainStatus,NRestarts 2>/dev/null || echo 'no systemd service'"),
+            run_ssh_command(f"journalctl -u {safe_name} --no-pager -n 80 --since '30 minutes ago' 2>/dev/null || echo 'no journal logs'"),
+            run_ssh_command(f"ss -tlnp 2>/dev/null | head -30"),
+            run_ssh_command(f"docker logs {safe_name} 2>&1 | grep -iE 'undefined|missing|not set|not found|permission denied|EACCES|ENOENT|migration|schema|alter|address already in use|bind|port.*already' | head -20 2>/dev/null || echo 'no deployment errors in docker'"),
+            run_ssh_command(f"journalctl -u {safe_name} --no-pager -n 200 --since '30 minutes ago' 2>/dev/null | grep -iE 'undefined|missing|not set|not found|permission denied|EACCES|ENOENT|migration|schema|address already in use|bind' | head -20 || echo 'no deployment errors in journal'"),
+            run_ssh_command(f"pgrep -a {safe_name} 2>/dev/null | head -5 || echo 'no process'"),
+            return_exceptions=True
+        )
+
+        docker_info = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        docker_logs = str(checks[1]) if not isinstance(checks[1], Exception) else "no logs"
+        systemd_info = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        journal_logs = str(checks[3]) if not isinstance(checks[3], Exception) else "no logs"
+        ports_out = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        docker_deploy_errors = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        journal_deploy_errors = str(checks[6]) if not isinstance(checks[6], Exception) else "check failed"
+        process_out = str(checks[7]) if not isinstance(checks[7], Exception) else "check failed"
+
+        findings = []
+        platform_detected = None
+        startup_logs = ""
+
+        if "no docker container" not in docker_info and (platform in ("auto", "docker")):
+            platform_detected = "Docker"
+            for part in docker_info.split():
+                if part.startswith("Status:") and "running" not in part.lower():
+                    findings.append(("CRITICAL", f"Docker container is not running: {part}", ""))
+                if part.startswith("RestartCount:"):
+                    count = part.split(":")[1]
+                    if count.isdigit() and int(count) > 3:
+                        findings.append(("WARNING", f"High restart count: {count} — likely a crash loop", ""))
+                if part.startswith("ExitCode:"):
+                    code = part.split(":")[1]
+                    if code != "0":
+                        exit_meanings = {"137": "OOM/SIGKILL", "139": "Segfault", "1": "App error", "126": "Permission denied", "127": "Command not found"}
+                        findings.append(("CRITICAL", f"Container exited with code {code} ({exit_meanings.get(code, 'unknown')})", ""))
+            startup_logs = docker_logs
+
+        if not platform_detected and "no systemd service" not in systemd_info and (platform in ("auto", "systemd")):
+            platform_detected = "systemd"
+            if "ActiveState=failed" in systemd_info:
+                findings.append(("CRITICAL", "Systemd service is in failed state", systemd_info[:200]))
+            elif "ActiveState=inactive" in systemd_info:
+                findings.append(("WARNING", "Systemd service is inactive", ""))
+            startup_logs = journal_logs
+
+        if not platform_detected:
+            if "no process" not in process_out:
+                platform_detected = "process"
+                findings.append(("OK", f"Process '{app_name}' is running", process_out.strip()))
+            else:
+                findings.append(("CRITICAL", f"Application '{app_name}' not found on any platform", ""))
+
+        deploy_errors = docker_deploy_errors if platform_detected == "Docker" else journal_deploy_errors
+        if "no deployment errors" not in deploy_errors and deploy_errors.strip():
+            error_categories = {
+                "address already in use": "Port conflict — another process is using the same port",
+                "permission denied": "Permission denied — check file ownership and capabilities",
+                "EACCES": "Permission denied — check file ownership and capabilities",
+                "not found": "Missing file or command — check image/package completeness",
+                "ENOENT": "Missing file — check volume mounts and paths",
+                "undefined": "Missing environment variable — check .env or container env config",
+                "missing": "Missing configuration or dependency",
+                "not set": "Missing environment variable",
+                "migration": "Database migration issue — check DB connectivity and migration status",
+                "schema": "Database schema issue — migration may have failed",
+            }
+            for pattern, description in error_categories.items():
+                if pattern.lower() in deploy_errors.lower():
+                    findings.append(("CRITICAL", description, ""))
+                    break
+
+        findings.sort(key=lambda x: {"CRITICAL": 0, "WARNING": 1, "OK": 2}.get(x[0], 3))
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: Deployment Issue — {app_name}\n"
+        result += f"{'='*60}\n\n"
+
+        result += f"  Platform:  {platform_detected or 'NOT FOUND'}\n\n"
+
+        if critical_count > 0:
+            result += f"  STATUS: CRITICAL ({critical_count} critical, {warning_count} warnings)\n\n"
+        elif warning_count > 0:
+            result += f"  STATUS: WARNING ({warning_count} warnings)\n\n"
+        else:
+            result += f"  STATUS: OK (deployment appears healthy)\n\n"
+
+        result += "--- Findings ---\n\n"
+        for sev, msg, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(sev, "?")
+            result += f"  [{sev}] {icon} {msg}\n"
+            if detail:
+                for line in str(detail).strip().split('\n')[:3]:
+                    result += f"           {line}\n"
+            result += "\n"
+
+        if deploy_errors and "no deployment errors" not in deploy_errors:
+            result += "--- Deployment Error Patterns Found ---\n\n"
+            for line in deploy_errors.split('\n')[:15]:
+                result += f"  {line}\n"
+            result += "\n"
+
+        if startup_logs and "no" not in startup_logs[:20].lower():
+            result += "--- Startup Logs ---\n\n"
+            for line in startup_logs.split('\n')[:30]:
+                result += f"  {line}\n"
+            result += "\n"
+
+        result += "--- Listening Ports ---\n\n"
+        for line in ports_out.split('\n')[:15]:
+            result += f"  {line}\n"
+        result += "\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if "Port conflict" in str(findings):
+            result += "  1. Find what's using the port: ss -tlnp | grep :<port>\n"
+            result += "  2. Stop the conflicting process or change the app's port\n"
+        elif "Permission denied" in str(findings):
+            result += "  1. Check file permissions and ownership\n"
+            result += "  2. Verify the container user has the right capabilities\n"
+        elif "Missing environment variable" in str(findings):
+            result += "  1. Compare deployed env vars with the expected configuration\n"
+            result += "  2. Check .env file or container environment settings\n"
+        elif "migration" in str(findings).lower():
+            result += "  1. Check database connectivity\n"
+            result += "  2. Run migrations manually and check for errors\n"
+        else:
+            result += "  1. Review startup logs above for the first error\n"
+            result += "  2. Verify all dependencies are available\n"
+            result += "  3. Check environment variables and configuration\n"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error diagnosing deployment issue: {str(e)}"
+
+
+@mcp.tool()
+async def diagnose_connectivity_issue(host: str, port: int, protocol: str = "tcp") -> str:
+    """
+    Diagnose connectivity issues layer by layer: DNS, port, process, SSL, firewall.
+
+    Args:
+        host: Hostname or IP to test connectivity to
+        port: Port number to test
+        protocol: Protocol to test — "tcp", "http", or "https" (default "tcp")
+    """
+    try:
+        if not re.match(r'^[a-zA-Z0-9._-]+$', host):
+            return "Error: Invalid hostname. Only alphanumeric, dots, underscores, and hyphens allowed."
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return "Error: port must be between 1 and 65535"
+        if protocol not in ALLOWED_PROTOCOLS:
+            return f"Error: protocol must be one of {', '.join(sorted(ALLOWED_PROTOCOLS))}"
+
+        safe_host = shlex.quote(host)
+        safe_port = str(port)
+
+        checks = await asyncio.gather(
+            run_ssh_command(f"dig +short {safe_host} A 2>/dev/null || nslookup {safe_host} 2>/dev/null | grep -A1 'Name:' || echo 'DNS resolution failed'"),
+            run_ssh_command(f"ss -tlnp 2>/dev/null | grep :{safe_port} || echo 'port not listening locally'"),
+            run_ssh_command(f"bash -c 'echo > /dev/tcp/{host}/{safe_port}' 2>/dev/null && echo 'TCP connection successful' || echo 'TCP connection failed'"),
+            run_ssh_command(f"curl -sI -m 5 http{'s' if protocol == 'https' else ''}://{host}:{safe_port}/ 2>/dev/null | head -5 || echo 'HTTP request failed'"),
+            run_ssh_command(f"openssl s_client -connect {host}:{safe_port} -servername {host} </dev/null 2>/dev/null | grep -E 'subject|issuer|notAfter|Verify return' | head -5 || echo 'no SSL info'") if protocol == "https" or port == 443 else run_ssh_command("echo 'skipped'"),
+            run_ssh_command(f"iptables -L -n 2>/dev/null | grep -E ':{safe_port}|REJECT|DROP' | head -10 || echo 'no iptables rules found (or no permission)'"),
+            run_ssh_command(f"ufw status 2>/dev/null | grep -E '{safe_port}|Status' || echo 'ufw not available'"),
+            run_ssh_command("ip addr show 2>/dev/null | grep 'inet ' | head -10"),
+            return_exceptions=True
+        )
+
+        dns_out = str(checks[0]) if not isinstance(checks[0], Exception) else "check failed"
+        local_port = str(checks[1]) if not isinstance(checks[1], Exception) else "check failed"
+        tcp_test = str(checks[2]) if not isinstance(checks[2], Exception) else "check failed"
+        http_test = str(checks[3]) if not isinstance(checks[3], Exception) else "check failed"
+        ssl_out = str(checks[4]) if not isinstance(checks[4], Exception) else "check failed"
+        iptables_out = str(checks[5]) if not isinstance(checks[5], Exception) else "check failed"
+        ufw_out = str(checks[6]) if not isinstance(checks[6], Exception) else "check failed"
+        interfaces = str(checks[7]) if not isinstance(checks[7], Exception) else "check failed"
+
+        findings = []
+
+        if "DNS resolution failed" in dns_out or not dns_out.strip():
+            findings.append(("CRITICAL", f"DNS resolution failed for '{host}'", "Cannot resolve hostname to IP address"))
+        else:
+            findings.append(("OK", f"DNS resolves: {host} → {dns_out.strip()[:100]}", ""))
+
+        if "port not listening locally" in local_port:
+            findings.append(("WARNING", f"Port {port} is not listening on this server", "If the target is this server, the service may be down"))
+        else:
+            findings.append(("OK", f"Port {port} is listening locally", local_port.strip()[:200]))
+
+        if "TCP connection successful" in tcp_test:
+            findings.append(("OK", f"TCP connection to {host}:{port} successful", ""))
+        else:
+            findings.append(("CRITICAL", f"TCP connection to {host}:{port} FAILED", "Port may be blocked by firewall or service is down"))
+
+        if protocol in ("http", "https"):
+            if "HTTP request failed" in http_test:
+                findings.append(("WARNING", f"HTTP{'S' if protocol == 'https' else ''} request failed", "Service may not be responding to HTTP"))
+            else:
+                findings.append(("OK", f"HTTP response received", http_test.strip()[:200]))
+
+        if (protocol == "https" or port == 443) and "no SSL info" not in ssl_out and "skipped" not in ssl_out:
+            if "Verify return code: 0" in ssl_out:
+                findings.append(("OK", "SSL certificate is valid", ssl_out.strip()[:200]))
+            elif ssl_out.strip():
+                findings.append(("WARNING", "SSL certificate issue", ssl_out.strip()[:200]))
+
+        if "REJECT" in iptables_out or "DROP" in iptables_out:
+            findings.append(("WARNING", "Firewall rules may be blocking traffic", iptables_out.strip()[:200]))
+
+        findings.sort(key=lambda x: {"CRITICAL": 0, "WARNING": 1, "OK": 2}.get(x[0], 3))
+        critical_count = sum(1 for f in findings if f[0] == "CRITICAL")
+        warning_count = sum(1 for f in findings if f[0] == "WARNING")
+
+        result = f"{'='*60}\n"
+        result += f"  DIAGNOSTIC REPORT: Connectivity — {host}:{port} ({protocol})\n"
+        result += f"{'='*60}\n\n"
+
+        if critical_count > 0:
+            result += f"  STATUS: CRITICAL ({critical_count} critical, {warning_count} warnings)\n\n"
+        elif warning_count > 0:
+            result += f"  STATUS: WARNING ({warning_count} warnings)\n\n"
+        else:
+            result += f"  STATUS: OK (connectivity looks good)\n\n"
+
+        result += "--- Layer-by-Layer Analysis ---\n\n"
+        layers = ["DNS", "Port", "TCP", "HTTP", "SSL", "Firewall"]
+        for sev, msg, detail in findings:
+            icon = {"CRITICAL": "✗", "WARNING": "⚠", "OK": "✓"}.get(sev, "?")
+            result += f"  [{sev}] {icon} {msg}\n"
+            if detail:
+                for line in str(detail).strip().split('\n')[:2]:
+                    result += f"           {line}\n"
+            result += "\n"
+
+        result += "--- Network Interfaces ---\n\n"
+        for line in interfaces.split('\n')[:10]:
+            result += f"  {line}\n"
+        result += "\n"
+
+        result += "--- Firewall Status ---\n\n"
+        result += f"  iptables: {iptables_out.strip()[:200]}\n"
+        result += f"  ufw:      {ufw_out.strip()[:200]}\n\n"
+
+        result += "--- Recommended Next Steps ---\n\n"
+        if "DNS resolution failed" in str(findings):
+            result += "  1. Check DNS configuration (/etc/resolv.conf)\n"
+            result += "  2. Verify the hostname is correct\n"
+            result += "  3. Try using the IP address directly\n"
+        elif "TCP connection" in str(findings) and "FAILED" in str(findings):
+            result += "  1. Check if the service is running on the target host\n"
+            result += "  2. Check firewall rules (iptables, ufw, cloud security groups)\n"
+            result += "  3. Verify network routing between source and destination\n"
+        elif "SSL certificate issue" in str(findings):
+            result += "  1. Check certificate expiry date\n"
+            result += "  2. Verify the certificate matches the hostname\n"
+            result += "  3. Ensure the full certificate chain is configured\n"
+        else:
+            result += "  1. Connectivity appears healthy at the network level\n"
+            result += "  2. Check application-level health and configuration\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error diagnosing connectivity: {str(e)}"
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
