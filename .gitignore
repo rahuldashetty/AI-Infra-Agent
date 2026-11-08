@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+.venv.old-python314/
+.vscode/
+.claude/
+.data/
+*.swp
+.DS_Store
+uv.lock
