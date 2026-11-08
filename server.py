@@ -777,3 +777,75 @@ async def check_dmesg_errors(lines: int = 50) -> str:
         return f"Error checking dmesg errors: {str(e)}"
 
 
+# ===========================
+# DNS & Security Tools
+# ===========================
+
+@mcp.tool()
+async def check_dns_resolution(domain: str) -> str:
+    """
+    Test DNS resolution for a domain from the server's perspective.
+
+    Performs both A record and MX record lookups. Essential for debugging
+    connectivity issues and verifying DNS propagation.
+
+    Args:
+        domain: Domain name to resolve (alphanumeric, dots, hyphens only)
+
+    Returns:
+        A record and MX record resolution results
+    """
+    try:
+        # Validate domain name
+        _sanitize_identifier(domain, "domain")
+
+        # Query A records
+        a_command = f"dig +short {shlex.quote(domain)} A"
+        a_output = await run_ssh_command(a_command)
+
+        # Query MX records
+        mx_command = f"dig +short {shlex.quote(domain)} MX"
+        mx_output = await run_ssh_command(mx_command)
+
+        result = f"DNS resolution for '{domain}':\n\n"
+        result += "--- A Records ---\n"
+        result += a_output.strip() if a_output.strip() else "(no A records found)\n"
+        result += "\n\n--- MX Records ---\n"
+        result += mx_output.strip() if mx_output.strip() else "(no MX records found)"
+
+        return result
+
+    except ValueError as e:
+        return f"Validation error: {str(e)}"
+    except Exception as e:
+        return f"Error checking DNS resolution: {str(e)}"
+
+
+@mcp.tool()
+async def check_recent_logins(lines: int = 20) -> str:
+    """
+    Show recent login sessions to the server.
+
+    Lists user logins with timestamps, source IPs, and session duration.
+    Useful for security audits and tracking access patterns.
+
+    Args:
+        lines: Number of login records to show (1-100, default 20)
+
+    Returns:
+        Recent login history from wtmp
+    """
+    try:
+        # Validate lines parameter
+        if not isinstance(lines, int) or lines < 1 or lines > 100:
+            return "Error: lines must be between 1 and 100"
+
+        command = f"last -n {lines}"
+        output = await run_ssh_command(command)
+
+        return f"Recent login sessions (last {lines} entries):\n\n{output}"
+
+    except Exception as e:
+        return f"Error checking recent logins: {str(e)}"
+
+
