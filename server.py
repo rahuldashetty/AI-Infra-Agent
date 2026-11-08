@@ -252,3 +252,145 @@ async def run_ssh_command(command: str) -> str:
         return output.strip()
 
 
+@mcp.tool()
+async def check_disk_usage() -> str:
+    """
+    Check disk usage on the remote server.
+
+    Returns filesystem usage information including size, used space,
+    available space, and mount points for all mounted filesystems.
+    """
+    try:
+        output = await run_ssh_command("df -h")
+        return f"Disk usage on remote server:\n\n{output}"
+    except Exception as e:
+        return f"Error checking disk usage: {str(e)}"
+
+
+@mcp.tool()
+async def check_docker_containers() -> str:
+    """
+    List all Docker containers on the remote server.
+
+    Shows container ID, name, status, and port mappings for both
+    running and stopped containers.
+    """
+    try:
+        command = 'docker ps -a --format "table {{.ID}}\\t{{.Names}}\\t{{.Status}}\\t{{.Ports}}"'
+        output = await run_ssh_command(command)
+        return f"Docker containers on remote server:\n\n{output}"
+    except Exception as e:
+        return f"Error listing Docker containers: {str(e)}"
+
+
+@mcp.tool()
+async def run_sql_query(query: str) -> str:
+    """
+    Run a read-only SQL query against the remote database.
+
+    SECURITY: Only SELECT, SHOW, DESCRIBE, DESC, and EXPLAIN queries are allowed.
+    Queries that modify data (INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE) are rejected.
+
+    Args:
+        query: SQL query to execute (must be a read-only query)
+
+    Returns:
+        Query results as a formatted string
+    """
+    try:
+        _validate_sql_readonly(query)
+
+        db_host = os.environ.get("DB_HOST")
+        db_port = os.environ.get("DB_PORT", "3306")
+        db_user = os.environ.get("DB_USER", "app")
+        db_pass = os.environ.get("DB_PASS")
+        db_name = os.environ.get("DB_NAME", "app")
+
+        if not db_host:
+            return "Error: DB_HOST environment variable is required"
+        if not db_pass:
+            return "Error: DB_PASS environment variable is required"
+
+        quoted_query = shlex.quote(query)
+
+        command = (
+            f"mysql "
+            f"-h {shlex.quote(db_host)} "
+            f"-P {shlex.quote(db_port)} "
+            f"-u {shlex.quote(db_user)} "
+            f"-p{shlex.quote(db_pass)} "
+            f"--safe-updates "
+            f"{shlex.quote(db_name)} "
+            f"-e {quoted_query}"
+        )
+
+        output = await run_ssh_command(command)
+        return f"Query results:\n\n{output}"
+
+    except ValueError as e:
+        return f"Query blocked: {str(e)}"
+    except Exception as e:
+        return f"Error executing query: {str(e)}"
+
+
+@mcp.tool()
+async def check_service_status(service_name: str) -> str:
+    """
+    Check the status of a systemd service.
+
+    Returns the current service status from systemctl and the last 50 log lines
+    from journalctl. This is a read-only operation that doesn't modify the service.
+
+    Args:
+        service_name: Name of the systemd service (e.g., "nginx", "my-app")
+    """
+    try:
+        if not re.match(r'^[a-zA-Z0-9._@:-]+$', service_name):
+            return "Error: Invalid service name. Only alphanumeric, dots, underscores, @, colons, and hyphens allowed."
+
+        safe_name = shlex.quote(service_name)
+        status_output = await run_ssh_command(f"systemctl status {safe_name}")
+        logs_output = await run_ssh_command(f"journalctl -u {safe_name} --no-pager -n 50")
+
+        return f"Service Status ({service_name}):\n\n{status_output}\n\n--- Recent Logs (last 50 lines) ---\n\n{logs_output}"
+    except Exception as e:
+        return f"Error checking service status: {str(e)}"
+
+
+@mcp.tool()
+async def restart_service(service_name: str) -> str:
+    """
+    Restart a systemd service and verify it's running. MUTATING TOOL.
+
+    Executes the following steps:
+    1. Runs 'sudo systemctl restart <service>' (requires passwordless sudo)
+    2. Waits 2 seconds for service to stabilize
+    3. Checks if service is active with 'systemctl is-active'
+    4. Retrieves recent logs from the last 2 minutes
+
+    Args:
+        service_name: Name of the systemd service to restart (e.g., "nginx", "my-app")
+    """
+    try:
+        if not re.match(r'^[a-zA-Z0-9._@:-]+$', service_name):
+            return "Error: Invalid service name. Only alphanumeric, dots, underscores, @, colons, and hyphens allowed."
+
+        safe_name = shlex.quote(service_name)
+        restart_output = await run_ssh_command(f"sudo systemctl restart {safe_name}")
+
+        await asyncio.sleep(2)
+
+        is_active_output = await run_ssh_command(f"systemctl is-active {safe_name}")
+        logs_output = await run_ssh_command(f'journalctl -u {safe_name} --no-pager -n 50 --since "2 minutes ago"')
+
+        service_status = "✓ ACTIVE" if is_active_output.strip() == "active" else f"✗ NOT ACTIVE (status: {is_active_output.strip()})"
+
+        return (
+            f"Service Restart Results ({service_name}):\n\n"
+            f"Restart Command: Executed\n"
+            f"Service Status: {service_status}\n\n"
+            f"--- Recent Logs (last 2 minutes) ---\n\n{logs_output}"
+        )
+    except Exception as e:
+        return f"Error restarting service: {str(e)}"
+
