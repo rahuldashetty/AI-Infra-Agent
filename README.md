@@ -6,19 +6,81 @@ Built on the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) �
 
 ## What Makes InfraAgent Different
 
-Most server diagnostic tools expose individual commands. InfraAgent's **workflow tools** run full diagnostic decision trees — investigating issues the way a DevOps engineer would:
+Most server diagnostic tools expose individual commands. InfraAgent's **workflow tools** run full diagnostic decision trees — investigating issues the way a DevOps engineer would.
 
+### Auto-detection: how it knows what's running
+
+You say _"my database is not working"_ — you didn't specify the engine or how it runs. InfraAgent figures it out:
+
+```mermaid
+flowchart TD
+    A["🗣️ User: my database is not working"] --> B
+
+    subgraph B["Layer 1 — detect_application_stack"]
+        direction LR
+        B1["ps aux | grep\nmysqld, postgres,\nmongod, redis..."] ~~~ B2["ss -tlnp\nAll listening\nports"] ~~~ B3["--version probes\nNode, Python, Java,\nGo, Ruby, .NET, PHP"]
+    end
+
+    B -->|"Found: PostgreSQL on :5432"| C
+
+    subgraph C["Layer 2 — find_application"]
+        direction LR
+        C1["🐳 Docker\ndocker ps"] ~~~ C2["⚙️ systemd\nsystemctl"] ~~~ C3["☸️ Kubernetes\nkubectl"] ~~~ C4["📦 PM2\npm2 show"] ~~~ C5["🖥️ Bare\npgrep"]
+    end
+
+    C -->|"Found in: Docker container postgres-db"| D
+
+    subgraph D["Layer 3 — Platform-aware diagnosis"]
+        direction LR
+        D1["docker logs\n→ errors"] ~~~ D2["docker inspect\n→ health"] ~~~ D3["docker stats\n→ resources"]
+    end
+
+    D --> E["📋 Structured report\nCRITICAL / WARNING / OK"]
+
+    style A fill:#f3f0ff,stroke:#7f77dd,color:#26215c
+    style E fill:#e1f5ee,stroke:#1d9e75,color:#04342c
 ```
-User: "I'm getting 500 errors on my API"
 
-InfraAgent (diagnose_http_error):
-  → Checks if the app is running (Docker, systemd, process)
-  → Tests port binding
-  → Scans logs for error patterns
-  → Checks database connectivity
-  → Analyzes disk, memory, CPU
-  → Checks for OOM kills
-  → Returns: structured report with CRITICAL/WARNING/OK findings + recommended next steps
+> **All probes in each layer run in parallel** via `asyncio.gather` — the full detection completes in 1-3 seconds, not minutes.
+
+### Diagnostic workflow: what happens inside `diagnose_http_error`
+
+When the AI calls `diagnose_http_error("my-api", 80, 500)`, InfraAgent fires **12 SSH commands simultaneously**:
+
+```mermaid
+flowchart TD
+    A["diagnose_http_error\n(app_name, port, error_code)"] --> B["SSH into server\nasyncssh + key from .env"]
+
+    B --> P & L & R & DI
+
+    subgraph P["Process checks"]
+        P1["docker ps -a"]
+        P2["systemctl is-active"]
+        P3["pgrep -a"]
+        P4["ss -tlnp :port"]
+    end
+
+    subgraph L["Log search"]
+        L1["docker logs | grep\nerror|exception|fatal"]
+        L2["journalctl | grep\nerror|exception|fatal"]
+    end
+
+    subgraph R["Resource checks"]
+        R1["df -h (disk)"]
+        R2["free -m (memory)"]
+        R3["uptime (CPU load)"]
+        R4["dmesg (OOM kills)"]
+    end
+
+    subgraph DI["Docker deep-dive"]
+        DI1["docker inspect\nexit code, OOMKilled,\nrestart count"]
+    end
+
+    P & L & R & DI --> AN["Analyze against thresholds\ndisk >95% · mem >85% · load >2x cores"]
+    AN --> RP["📋 Severity-ranked report\nCRITICAL → WARNING → OK\n+ recommended next steps"]
+
+    style A fill:#f3f0ff,stroke:#7f77dd,color:#26215c
+    style RP fill:#e1f5ee,stroke:#1d9e75,color:#04342c
 ```
 
 ## Features
@@ -175,7 +237,7 @@ Quit and restart Claude Desktop for changes to take effect.
 ## Security
 
 ### Read-Only by Design
-- 52 of 53 tools are read-only and cannot modify server state
+- 42 of 43 tools are read-only and cannot modify server state
 - The only mutating tool (`restart_service`) is clearly marked in its docstring
 
 ### Input Validation
@@ -226,15 +288,15 @@ python -m py_compile server.py
 
 | Category | Count |
 |----------|-------|
-| Database & Service Management | 14 |
+| Database & Service Management | 4 |
 | System Monitoring | 18 |
 | Runtime Detection | 5 |
 | Application Diagnostics | 5 |
 | Smart Troubleshooting | 5 |
 | Junior DevOps Workflows | 6 |
-| **Total** | **53** |
+| **Total** | **43** |
 
-52 read-only + 1 mutating (`restart_service`)
+42 read-only + 1 mutating (`restart_service`)
 
 ## License
 
