@@ -1,5 +1,10 @@
 # InfraAgent
 
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Tools](https://img.shields.io/badge/tools-43-green.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)
+![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)
+
 **Your AI Junior DevOps Engineer** — an MCP server that SSHes into any remote Linux server, auto-detects the runtime environment, and performs intelligent diagnostics like a junior DevOps engineer investigating production issues.
 
 Built on the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) — designed to be used with Claude Desktop, Claude Code, or any MCP-compatible AI client.
@@ -300,4 +305,4 @@ python -m py_compile server.py
 
 ## License
 
-This project is for internal use managing server infrastructure.
+MIT — see [LICENSE](LICENSE) for details.
